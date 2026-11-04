@@ -290,6 +290,11 @@ def _cho_solve(c, b, lower, overwrite_b, check_finite):
 
     overwrite_b = overwrite_b or _datacopied(b1, b)
 
+    # potrs takes one lower flag. Batching can leave an array; the
+    # converter kept its first element, so pass that scalar.
+    if np.ndim(lower) > 0:
+        lower = np.asarray(lower).reshape(-1)[0].item()
+
     potrs, = get_lapack_funcs(('potrs',), (c, b1))
     x, info = potrs(c, b1, lower=lower, overwrite_b=overwrite_b)
     if info != 0:

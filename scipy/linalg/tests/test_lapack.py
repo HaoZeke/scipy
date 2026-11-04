@@ -3196,9 +3196,9 @@ def test_gees_trsen(dtype):
     lwork = _compute_lwork(trsen_lwork, select, t)
 
     if dtype in COMPLEX_DTYPES:
-        result = trsen(select, t, z, lwork=lwork)
+        result = trsen(select, t, z, lwork=int(lwork))
     else:
-        result = trsen(select, t, z, lwork=lwork, liwork=lwork[1])
+        result = trsen(select, t, z, lwork=int(lwork[0]), liwork=int(lwork[1]))
     assert_equal(result[-1], 0)
 
     t = result[0]
@@ -3268,9 +3268,9 @@ def test_trsen_NAG(t, q, select, expect, expect_s, expect_sep):
     lwork = _compute_lwork(trsen_lwork, select, t)
 
     if t.dtype in COMPLEX_DTYPES:
-        result = trsen(select, t, q, lwork=lwork)
+        result = trsen(select, t, q, lwork=int(lwork))
     else:
-        result = trsen(select, t, q, lwork=lwork, liwork=lwork[1])
+        result = trsen(select, t, q, lwork=int(lwork[0]), liwork=int(lwork[1]))
     assert_equal(result[-1], 0)
 
     t = result[0]
@@ -3320,10 +3320,15 @@ def test_gges_tgsen(dtype):
     select = np.zeros(n)
     select[6] = 1
 
-    lwork = _compute_lwork(tgsen_lwork, select, s, t)
+    if dtype in COMPLEX_DTYPES:
+        lwork = _compute_lwork(tgsen_lwork, select, s, t)
+    else:
+        # The real query takes an integer here. Its first element was used.
+        queried = int(np.asarray(t).reshape(-1)[0])
+        lwork = _compute_lwork(tgsen_lwork, select, s, queried)
 
     # off-by-one error in LAPACK, see gh-issue #13397
-    lwork = (lwork[0]+1, lwork[1])
+    lwork = int(lwork[0]) + 1
 
     result = tgsen(select, s, t, q, z, lwork=lwork)
     assert_equal(result[-1], 0)
@@ -3464,8 +3469,8 @@ def test_sy_hetrs(mtype, dtype, lower):
     b = rng.uniform(size=(n, nrhs)).astype(dtype)
     names = f'{mtype}trf', f'{mtype}trf_lwork', f'{mtype}trs'
     trf, trf_lwork, trs = get_lapack_funcs(names, dtype=dtype)
-    lwork = trf_lwork(n, lower=lower)
-    ldu, ipiv, info = trf(A, lwork=lwork, lower=lower)
+    work, _info = trf_lwork(n, lower=lower)
+    ldu, ipiv, info = trf(A, lwork=int(work), lower=lower)
     assert info == 0
     x, info = trs(a=ldu, ipiv=ipiv, b=b, lower=lower)
     assert info == 0
