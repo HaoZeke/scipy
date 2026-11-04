@@ -3470,7 +3470,8 @@ def test_sy_hetrs(mtype, dtype, lower):
     names = f'{mtype}trf', f'{mtype}trf_lwork', f'{mtype}trs'
     trf, trf_lwork, trs = get_lapack_funcs(names, dtype=dtype)
     work, _info = trf_lwork(n, lower=lower)
-    ldu, ipiv, info = trf(A, lwork=int(work), lower=lower)
+    # A complex query returns a complex size. The converter used its real part.
+    ldu, ipiv, info = trf(A, lwork=int(np.real(work)), lower=lower)
     assert info == 0
     x, info = trs(a=ldu, ipiv=ipiv, b=b, lower=lower)
     assert info == 0
