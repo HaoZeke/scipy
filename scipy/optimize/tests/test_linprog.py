@@ -3,6 +3,7 @@ Unit test for Linear Programming
 """
 import sys
 import platform
+import traceback
 import warnings
 from typing import Any
 
@@ -11,7 +12,8 @@ from numpy.exceptions import VisibleDeprecationWarning
 from numpy.testing import (assert_, assert_allclose, assert_equal,
                            assert_array_less)
 from pytest import raises as assert_raises
-from scipy.optimize import linprog, OptimizeWarning
+from scipy.optimize import linprog, linprog_verbose_callback, OptimizeWarning
+from scipy.optimize._linprog import linprog_terse_callback
 from scipy.optimize._numdiff import approx_derivative
 from scipy.sparse.linalg import MatrixRankWarning
 from scipy.linalg import LinAlgWarning
@@ -1787,18 +1789,224 @@ class LinprogRSTests(LinprogCommonTests):
         pytest.skip("Intermittent failure acceptable.")
 
 
+def _callback_problem():
+    """Small dense LP with inequality and equality constraints.
+
+    ``x = [2, 6]`` is optimal, so both ``slack`` and ``con`` are nonempty
+    and the reference solution is known. Presolve is left to the caller:
+    turning it off forces the simplex or interior-point solver to run.
+    """
+    c = np.array([-3.0, -2.0])
+    A_ub = np.array([[2.0, 1.0], [1.0, 1.0], [1.0, 0.0]])
+    b_ub = np.array([10.0, 8.0, 4.0])
+    A_eq = np.array([[1.0, 1.0]])
+    b_eq = np.array([8.0])
+    return c, A_ub, b_ub, A_eq, b_eq
+
+
+def _record_callback(store):
+    def cb(res):
+        store.append({
+            'x': None if res.x is None else np.array(res.x, copy=True),
+            'fun': None if res.fun is None else float(res.fun),
+            'slack': (None if res.slack is None
+                      else np.array(res.slack, copy=True)),
+            'con': None if res.con is None else np.array(res.con, copy=True),
+            'success': res.success,
+            'status': res.status,
+            'nit': res.nit,
+            'message': res.message,
+            'phase': res.phase,
+            'complete': res.complete,
+        })
+    return cb
+
+
+def _assert_callback_matches_result(call, res):
+    assert call['complete'] is True
+    assert call['success'] is res.success
+    assert call['status'] == res.status
+    assert call['nit'] == res.nit
+    assert call['message'] == res.message
+    assert call['phase'] in (1, 2)
+    for key in ('x', 'fun', 'slack', 'con'):
+        got = call[key]
+        expected = res[key]
+        if expected is None:
+            assert got is None
+        else:
+            assert_allclose(got, expected, atol=0, rtol=0)
+
+
 class LinprogHiGHSTests(LinprogCommonTests):
     def test_callback(self):
-        # this is the problem from test_callback
-        def cb(res):
-            return None
-        c = np.array([-3, -2])
-        A_ub = [[2, 1], [1, 1], [1, 0]]
-        b_ub = [10, 8, 4]
-        assert_raises(NotImplementedError, linprog, c, A_ub=A_ub, b_ub=b_ub,
-                      callback=cb, method=self.method)
-        res = linprog(c, A_ub=A_ub, b_ub=b_ub, method=self.method)
+        generic_callback_test(self)
+
+    def test_highs_callback_progress_and_final(self):
+        # Presolve off so the interrupt callback has to run.
+        c, A_ub, b_ub, A_eq, b_eq = _callback_problem()
+        calls = []
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                      callback=_record_callback(calls), method=self.method,
+                      options={'presolve': False})
         _assert_success(res, desired_fun=-18.0, desired_x=[2, 6])
+        assert len(calls) >= 2
+        for mid in calls[:-1]:
+            assert mid['complete'] is False
+            assert mid['success'] is False
+            assert mid['status'] == 0
+            assert mid['message'] == ''
+            assert isinstance(mid['nit'], int)
+            assert mid['x'].shape == (c.size,)
+            assert mid['slack'].shape == (b_ub.size,)
+            assert mid['con'].shape == (b_eq.size,)
+            assert np.isnan(mid['x']).all()
+            assert np.isnan(mid['fun'])
+            assert np.isnan(mid['slack']).all()
+            assert np.isnan(mid['con']).all()
+            if self.method == 'highs-ipm':
+                assert mid['phase'] == 1
+            elif self.method == 'highs-ds':
+                assert mid['phase'] == 2
+            else:
+                assert mid['phase'] in (1, 2)
+        nits = [call['nit'] for call in calls]
+        assert nits == sorted(nits)
+        # Each solver reports a given iteration count once.
+        for phase in (1, 2):
+            phase_nits = [call['nit'] for call in calls[:-1]
+                          if call['phase'] == phase]
+            assert phase_nits == sorted(set(phase_nits))
+        _assert_callback_matches_result(calls[-1], res)
+
+    def test_highs_callback_stop_true(self):
+        c, A_ub, b_ub, A_eq, b_eq = _callback_problem()
+        calls = []
+
+        def cb(res):
+            _record_callback(calls)(res)
+            return True
+
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                      callback=cb, method=self.method,
+                      options={'presolve': False})
+        assert res.status == 5
+        assert res.status != 4
+        assert res.success is False
+        assert res.message.startswith(
+            "Optimization interrupted by callback.")
+        assert any(not call['complete'] for call in calls)
+        assert all(call['status'] != 4 for call in calls)
+        _assert_callback_matches_result(calls[-1], res)
+
+    def test_highs_callback_stop_iteration(self):
+        c, A_ub, b_ub, A_eq, b_eq = _callback_problem()
+        calls = []
+
+        def cb(res):
+            _record_callback(calls)(res)
+            # Raised on the final call as well. That call is after the
+            # solve, so linprog must still return the interrupted result.
+            raise StopIteration
+
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                      callback=cb, method=self.method,
+                      options={'presolve': False})
+        assert res.status == 5
+        assert res.status != 4
+        assert res.success is False
+        assert res.message.startswith(
+            "Optimization interrupted by callback.")
+        assert any(not call['complete'] for call in calls)
+        assert all(call['status'] != 4 for call in calls)
+        _assert_callback_matches_result(calls[-1], res)
+
+    def test_highs_callback_other_return_ignored(self):
+        c, A_ub, b_ub, A_eq, b_eq = _callback_problem()
+
+        def cb(res):
+            # Truthy, but not the boolean True. Must not interrupt.
+            return 1
+
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                      callback=cb, method=self.method,
+                      options={'presolve': False})
+        _assert_success(res, desired_fun=-18.0, desired_x=[2, 6])
+
+    def test_highs_callback_exception_propagates(self):
+        c, A_ub, b_ub, A_eq, b_eq = _callback_problem()
+
+        def cb(res):
+            raise RuntimeError("callback failed")
+
+        with pytest.raises(RuntimeError, match="callback failed"):
+            linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                    callback=cb, method=self.method,
+                    options={'presolve': False})
+
+    def test_highs_callback_disp_matches_quiet_count(self, capsys):
+        c, A_ub, b_ub, A_eq, b_eq = _callback_problem()
+
+        def _count(disp):
+            calls = []
+            linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                    callback=_record_callback(calls), method=self.method,
+                    options={'presolve': False, 'disp': disp})
+            return len(calls)
+
+        quiet = _count(False)
+        verbose = _count(True)
+        capsys.readouterr()
+        # Logging is not forwarded to the user callback.
+        assert verbose == quiet
+        assert quiet >= 1
+
+    def test_highs_callback_maxiter_is_status_1(self):
+        c, A_ub, b_ub, A_eq, b_eq = _callback_problem()
+        calls = []
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                      callback=_record_callback(calls), method=self.method,
+                      options={'presolve': False, 'maxiter': 1})
+        assert res.status == 1
+        assert res.status != 5
+        assert calls
+        assert calls[-1]['status'] == 1
+
+    def test_highs_callback_exception_traceback(self):
+        c, A_ub, b_ub, A_eq, b_eq = _callback_problem()
+
+        def cb(res):
+            raise RuntimeError("callback failed")
+
+        with pytest.raises(RuntimeError, match="callback failed") as exc_info:
+            linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                    callback=cb, method=self.method,
+                    options={'presolve': False})
+        frames = traceback.format_tb(exc_info.value.__traceback__)
+        assert any("callback failed" in frame or "cb" in frame
+                   for frame in frames)
+
+    def test_integrality_callback_on_non_mip_method(self):
+        # highs-ds and highs-ipm ignore integrality. method='highs' solves
+        # the MIP and is covered by test_linprog_mip_callback.
+        if self.method == "highs":
+            pytest.skip("integrality is supported for method='highs'")
+        c, A_ub, b_ub, _, _ = _callback_problem()
+        calls = []
+        with pytest.warns(OptimizeWarning, match="integrality"):
+            res = linprog(c, A_ub=A_ub, b_ub=b_ub, integrality=1,
+                          callback=_record_callback(calls),
+                          method=self.method, options={'presolve': False})
+        _assert_success(res, desired_fun=-18.0, desired_x=[2, 6])
+        assert calls[-1]['complete'] is True
+
+    def test_highs_sample_callbacks(self):
+        c, A_ub, b_ub, A_eq, b_eq = _callback_problem()
+        for sample in (linprog_verbose_callback, linprog_terse_callback):
+            res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                          callback=sample, method=self.method,
+                          options={'presolve': False})
+            _assert_success(res, desired_fun=-18.0, desired_x=[2, 6])
 
     @pytest.mark.parametrize("options",
                              [{"maxiter": -1},
@@ -2314,6 +2522,117 @@ class TestLinprogRSBland(LinprogRSTests):
 ############################################
 
 
+def _knapsack_problem():
+    value = np.array([6., 5., 8., 9., 6., 7., 3., 6.])
+    weight = np.array([2., 3., 6., 7., 5., 9., 4., 5.])
+    return -value, weight.reshape(1, -1), np.array([15.])
+
+
+def _set_cover_problem():
+    incidence = np.array([
+        [1., 1., 0., 0., 1., 0.],
+        [1., 0., 1., 0., 0., 1.],
+        [0., 1., 1., 1., 0., 0.],
+        [0., 0., 0., 1., 1., 0.],
+        [0., 0., 1., 0., 0., 1.],
+    ])
+    # A x >= 1 is written as -A x <= -1.
+    return np.ones(incidence.shape[1]), -incidence, -np.ones(incidence.shape[0])
+
+
+def _assert_mip_callback(problem, stop=None):
+    c, A_ub, b_ub = problem
+    calls = []
+
+    def cb(res):
+        calls.append({
+            'x': None if res.x is None else np.array(res.x, copy=True),
+            'fun': None if res.fun is None else float(res.fun),
+            'slack': (None if res.slack is None
+                      else np.array(res.slack, copy=True)),
+            'con': None if res.con is None else np.array(res.con, copy=True),
+            'success': res.success,
+            'status': res.status,
+            'nit': res.nit,
+            'message': res.message,
+            'phase': res.phase,
+            'complete': res.complete,
+            'mip_node_count': getattr(res, 'mip_node_count', None),
+            'mip_dual_bound': getattr(res, 'mip_dual_bound', None),
+            'mip_gap': getattr(res, 'mip_gap', None),
+        })
+        if stop is not None and not res.complete:
+            return stop(res)
+
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=(0, 1), integrality=1,
+                  callback=cb, method='highs')
+    assert calls
+    assert calls[-1]['complete'] is True
+    _assert_callback_matches_result(calls[-1], res)
+    for key in ('mip_node_count', 'mip_dual_bound', 'mip_gap'):
+        assert calls[-1][key] == res[key]
+    for mid in calls[:-1]:
+        assert mid['complete'] is False
+        assert mid['success'] is False
+        assert mid['status'] == 0
+        assert mid['phase'] == 2
+        assert mid['x'].shape == (c.size,)
+        assert mid['slack'].shape == (b_ub.size,)
+        assert mid['con'].shape == (0,)
+        assert mid['mip_node_count'] == mid['nit']
+        if np.isnan(mid['x']).all():
+            assert np.isnan(mid['fun'])
+            assert np.isnan(mid['slack']).all()
+        else:
+            assert_allclose(mid['fun'], float(c @ mid['x']))
+            assert_allclose(mid['slack'], b_ub - A_ub @ mid['x'])
+    return calls, res
+
+
+def test_linprog_mip_callback_incumbent_and_nodes():
+    for problem in (_knapsack_problem(), _set_cover_problem()):
+        calls, res = _assert_mip_callback(problem)
+        _assert_success(res)
+        incumbents = [call for call in calls[:-1]
+                      if not np.isnan(call['x']).all()]
+        assert incumbents
+        nodes = [call['nit'] for call in calls[:-1]
+                 if np.isnan(call['x']).all()]
+        assert nodes == sorted(set(nodes))
+
+
+def test_linprog_callback_time_limit_is_not_status_5():
+    rng = np.random.default_rng(1)
+    rng_a = rng.integers(0, 2, size=(30, 40)).astype(float)
+    res = linprog(rng.random(40), A_ub=rng_a, b_ub=np.full(30, 10.0),
+                  bounds=(0, 1), integrality=1, callback=lambda res: None,
+                  method='highs', options={'time_limit': 1e-4})
+    assert res.status == 1
+    assert res.status != 5
+    assert res.message.startswith("Time limit reached.")
+
+
+def test_linprog_mip_callback_stop():
+    c, A_ub, b_ub = _knapsack_problem()
+
+    def _stop(how):
+        def cb(res):
+            if not res.complete:
+                if how == 'true':
+                    return True
+                raise StopIteration
+        res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=(0, 1),
+                      integrality=1, callback=cb, method='highs')
+        assert res.status == 5
+        assert res.status != 4
+        assert res.success is False
+        assert res.message.startswith(
+            "Optimization interrupted by callback.")
+
+    _stop('true')
+    _stop('stop')
+
+
 class TestLinprogHiGHSSimplexDual(LinprogHiGHSTests):
     method = "highs-ds"
     options: dict[str, Any] = {}
@@ -2345,6 +2664,16 @@ class TestLinprogHiGHSSimplexDual(LinprogHiGHSTests):
 class TestLinprogHiGHSIPM(LinprogHiGHSTests):
     method = "highs-ipm"
     options: dict[str, Any] = {}
+
+
+class TestLinprogHiGHSAuto(LinprogHiGHSTests):
+    # ``method='highs'`` lets HiGHS choose simplex or the interior-point
+    # method. Callbacks follow whichever solver runs.
+    method = "highs"
+    options: dict[str, Any] = {}
+
+    def test_integrality_without_highs(self):
+        pytest.skip("integrality is supported for method='highs'")
 
 
 ###################################
