@@ -4,10 +4,11 @@ import numpy as np
 import scipy.optimize._highspy._core as _h
 # pyrefly: ignore[missing-module-attribute]
 from scipy.optimize._highspy import _highs_options as hopt
-from scipy.optimize._optimize import OptimizeWarning
+from scipy.optimize._optimize import OptimizeResult, OptimizeWarning
 
 
-def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality, options):
+def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality,
+                   options, callback=None, n_slack=0, n_con=0):
     '''Solve linear programs using HiGHS [1]_.
 
     Assume problems of the form:
@@ -203,8 +204,27 @@ def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality, opti
         )
         return res
 
-    # Solve the LP
+    # Register a callback only when the caller supplied one. With no
+    # callback, HiGHS is not given a callback function at all.
+    held_exception = []
+    stop_requested = []
+    if callback is not None:
+        _install_highs_callback(
+            highs, callback, numcol, n_slack, n_con, options.get("solver"),
+            isMip, c, indptr, indices, data, rhs, held_exception,
+            stop_requested)
+
     run_status = highs.run()
+    # Drop the std::function's reference to the Python callback now that
+    # the solve has returned. ``highs`` is local, so this also breaks
+    # the closure cycle as soon as the wrapper returns.
+    if callback is not None:
+        try:
+            highs.setCallback(None, None)
+        except (TypeError, RuntimeError):
+            pass
+    if held_exception:
+        raise held_exception[0]
     if run_status == _h.HighsStatus.kError:
         res.update(
             {
@@ -212,7 +232,7 @@ def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality, opti
                 "message": highs.modelStatusToString(highs.getModelStatus()),
             }
         )
-        return res
+        return _finish_callback_status(res, stop_requested)
 
     # Extract what we need from the solution
     model_status = highs.getModelStatus()
@@ -257,7 +277,7 @@ def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality, opti
                 "crossover_nit": info.crossover_iteration_count,
             }
         )
-        return res
+        return _finish_callback_status(res, stop_requested)
 
     # Should be safe to read the solution:
     solution = highs.getSolution()
@@ -301,7 +321,174 @@ def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality, opti
             }
         )
 
+    return _finish_callback_status(res, stop_requested)
+
+
+def _finish_callback_status(res, stop_requested):
+    """Report a callback stop as HiGHS status ``kInterrupt``.
+
+    ``kCallbackMipImprovingSolution`` ignores ``user_interrupt`` (HiGHS
+    asserts that it is false). A stop requested there is applied on the
+    next interrupt event, and again here if the solve returns before
+    that event.
+    """
+    if stop_requested or res.get("status") == _h.HighsModelStatus.kInterrupt:
+        res["status"] = _h.HighsModelStatus.kInterrupt
+        res["message"] = "Interrupted by user"
     return res
+
+
+def _csc_matvec(indptr, indices, values, x, n_row):
+    """CSC matrix-vector product. Duplicate column entries accumulate."""
+    indptr = np.asarray(indptr)
+    indices = np.asarray(indices)
+    values = np.asarray(values, dtype=float)
+    x = np.asarray(x, dtype=float)
+    y = np.zeros(n_row, dtype=float)
+    for col in range(x.size):
+        start = int(indptr[col])
+        end = int(indptr[col + 1])
+        if start != end:
+            np.add.at(y, indices[start:end], values[start:end] * x[col])
+    return y
+
+
+def _install_highs_callback(highs, callback, n_x, n_slack, n_con, solver,
+                            is_mip, c, indptr, indices, data, rhs,
+                            held_exception, stop_requested):
+    """Register ``callback`` on the simplex and/or IPM interrupt events.
+
+    ``highs-ds`` listens only to ``kCallbackSimplexInterrupt`` and reports
+    each distinct iteration count once: ``HEkk::bailout`` runs on every
+    pricing pass, so one iteration would otherwise be delivered several
+    times. ``highs-ipm`` listens only to ``kCallbackIpmInterrupt``. IPX
+    calls ``InterruptCheck()`` with its default iteration count of -1 from
+    crossover and factorization; those events are not IPM iterations and
+    are dropped. ``method='highs'`` (``solver is None``) registers both,
+    and whichever solver HiGHS runs delivers its events.
+
+    IPX catches ``std::exception`` around the solve, which would swallow a
+    Python exception raised from this callback. The exception is stored
+    and re-raised after ``Highs.run`` returns. pybind11 re-acquires the
+    GIL for the callback, so the mutable state below is only touched
+    while the GIL is held, including if HiGHS invokes the callback from
+    a worker thread.
+
+    A mixed-integer solve listens to ``kCallbackMipImprovingSolution``
+    (each new incumbent, in the original variable space) and
+    ``kCallbackMipInterrupt`` (``checkLimits``, once per distinct node
+    count). HiGHS asserts that an improving-solution callback does not
+    set ``user_interrupt``; a stop requested there is applied on the
+    next interrupt event. Logging callbacks are never started.
+    """
+    cb = _h.cb.HighsCallbackType
+    simplex_type = int(cb.kCallbackSimplexInterrupt)
+    ipm_type = int(cb.kCallbackIpmInterrupt)
+    mip_improv_type = int(cb.kCallbackMipImprovingSolution)
+    mip_interrupt_type = int(cb.kCallbackMipInterrupt)
+    if is_mip:
+        active = (cb.kCallbackMipImprovingSolution, cb.kCallbackMipInterrupt)
+    elif solver == "ipm":
+        active = (cb.kCallbackIpmInterrupt,)
+    elif solver == "simplex":
+        active = (cb.kCallbackSimplexInterrupt,)
+    else:
+        active = (cb.kCallbackSimplexInterrupt, cb.kCallbackIpmInterrupt)
+
+    seen_simplex = set()
+    seen_ipm = set()
+    seen_nodes = set()
+
+    def _request_stop(data_in, kind):
+        stop_requested.append(True)
+        # Improving-solution callbacks must not set user_interrupt.
+        if kind != mip_improv_type and data_in is not None:
+            data_in.user_interrupt = True
+
+    def _highs_callback(callback_type, _message, data_out, data_in, _user_data):
+        kind = int(callback_type)
+        honors_stop = kind != mip_improv_type
+        if held_exception:
+            if honors_stop and data_in is not None:
+                data_in.user_interrupt = True
+            return
+
+        improving = False
+        if kind == simplex_type:
+            nit = int(data_out.simplex_iteration_count)
+            if nit in seen_simplex:
+                return
+            seen_simplex.add(nit)
+            phase = 2
+        elif kind == ipm_type:
+            nit = int(data_out.ipm_iteration_count)
+            # Crossover and factorization, not an IPM iteration.
+            if nit == -1 or nit in seen_ipm:
+                return
+            seen_ipm.add(nit)
+            phase = 1
+        elif kind == mip_interrupt_type:
+            nit = int(data_out.mip_node_count)
+            if nit in seen_nodes:
+                if stop_requested and data_in is not None:
+                    data_in.user_interrupt = True
+                return
+            seen_nodes.add(nit)
+            phase = 2
+        elif kind == mip_improv_type:
+            nit = int(data_out.mip_node_count)
+            phase = 2
+            improving = True
+        else:
+            return
+
+        x = np.full(n_x, np.nan)
+        fun = float("nan")
+        slack = np.full(n_slack, np.nan)
+        con = np.full(n_con, np.nan)
+        if improving:
+            incumbent = np.array(data_out.mip_solution, dtype=float, copy=True)
+            # The incumbent is stored for the original model. When its
+            # length matches, slack and con are A and b of that model.
+            if incumbent.size == n_x:
+                x = incumbent
+                fun = float(np.dot(np.asarray(c, dtype=float), x))
+                residual = np.asarray(rhs, dtype=float) - _csc_matvec(
+                    indptr, indices, data, x, np.asarray(rhs).size)
+                slack = residual[:n_slack]
+                con = residual[n_slack:n_slack + n_con]
+
+        cb_res = OptimizeResult({
+            "x": x,
+            "fun": fun,
+            "slack": slack,
+            "con": con,
+            "success": False,
+            "status": 0,
+            "nit": int(nit),
+            "message": "",
+            "phase": phase,
+            "complete": False,
+        })
+        if kind in (mip_improv_type, mip_interrupt_type):
+            cb_res["mip_node_count"] = int(data_out.mip_node_count)
+            cb_res["mip_dual_bound"] = float(data_out.mip_dual_bound)
+            cb_res["mip_gap"] = float(data_out.mip_gap)
+        try:
+            stop = callback(cb_res) is True
+        except StopIteration:
+            stop = True
+        except BaseException as exc:
+            held_exception.append(exc)
+            _request_stop(data_in, kind)
+            return
+        if stop or (stop_requested and honors_stop):
+            _request_stop(data_in, kind)
+
+    # ``None`` is an empty std::function and clears any previous callback.
+    highs.setCallback(_highs_callback, None)
+    for callback_type in active:
+        highs.startCallback(callback_type)
 
 
 def check_option(highs_inst, option, value):

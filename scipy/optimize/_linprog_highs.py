@@ -51,7 +51,9 @@ def _highs_to_scipy_status_message(highs_status, highs_message):
         HighsModelStatus.kInfeasible: (2, "The problem is infeasible. "),
         HighsModelStatus.kUnbounded: (3, "The problem is unbounded. "),
         HighsModelStatus.kUnboundedOrInfeasible: (4, "The problem is unbounded "
-                                                  "or infeasible. ")}
+                                                  "or infeasible. "),
+        HighsModelStatus.kInterrupt: (
+            5, "Optimization interrupted by callback. ")}
     unrecognized = (4, "The HiGHS status code was not recognized. ")
     scipy_status, scipy_message = (
         scipy_statuses_messages.get(highs_status, unrecognized))
@@ -86,6 +88,30 @@ def _convert_to_highs_enum(option, option_str, choices):
         return choices[default_str]
 
 
+def _positive_count(value):
+    """Return ``value`` when it is a positive iteration count, else 0."""
+    if not value or value < 0:
+        return 0
+    return int(value)
+
+
+def _highs_callback_phase(solver, simplex_nit, ipm_nit):
+    """Phase of the solver whose iteration count `linprog` reports.
+
+    Interior-point iterations use phase 1 and simplex iterations use
+    phase 2. ``method='highs'`` follows whichever count is returned as
+    ``nit``: the simplex count when it is positive, otherwise the
+    interior-point count.
+    """
+    if solver == "ipm":
+        return 1
+    if solver == "simplex":
+        return 2
+    if _positive_count(ipm_nit) and not _positive_count(simplex_nit):
+        return 1
+    return 2
+
+
 def _linprog_highs(lp, solver, time_limit=None, presolve=True,
                    disp=False, maxiter=None,
                    dual_feasibility_tolerance=None,
@@ -94,6 +120,7 @@ def _linprog_highs(lp, solver, time_limit=None, presolve=True,
                    simplex_dual_edge_weight_strategy=None,
                    mip_rel_gap=None,
                    mip_max_nodes=None,
+                   callback=None,
                    **unknown_options):
     r"""
     Solve the following linear programming problem using one of the HiGHS
@@ -198,6 +225,8 @@ def _linprog_highs(lp, solver, time_limit=None, presolve=True,
                 ``3`` : Problem appears to be unbounded.
 
                 ``4`` : The HiGHS solver ran into a problem.
+
+                ``5`` : The solve was interrupted by the callback.
 
             message : str
                 A string descriptor of the exit status of the algorithm.
@@ -353,7 +382,9 @@ def _linprog_highs(lp, solver, time_limit=None, presolve=True,
         integrality = np.array(integrality)
 
     res = _highs_wrapper(c, A.indptr, A.indices, A.data, lhs, rhs,
-                         lb, ub, integrality.astype(np.uint8), options)
+                         lb, ub, integrality.astype(np.uint8), options,
+                         callback=callback, n_slack=b_ub.size,
+                         n_con=b_eq.size)
 
     # HiGHS represents constraints as lhs/rhs, so
     # Ax + s = b => Ax = b - s
@@ -411,6 +442,10 @@ def _linprog_highs(lp, solver, time_limit=None, presolve=True,
            'nit': res.get('simplex_nit', 0) or res.get('ipm_nit', 0),
            'crossover_nit': res.get('crossover_nit'),
            }
+
+    if callback is not None:
+        sol['phase'] = _highs_callback_phase(
+            solver, res.get('simplex_nit'), res.get('ipm_nit'))
 
     if np.any(x) and integrality is not None:
         sol.update({
