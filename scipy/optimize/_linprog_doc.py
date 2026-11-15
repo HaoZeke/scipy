@@ -103,11 +103,13 @@ def _linprog_highs_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         This argument is currently used only by the ``'highs'`` method and
         ignored otherwise.
     callback : callable, optional
-        Called for each iteration of whichever LP solver HiGHS selects,
-        and once more after the solver returns. With `integrality`, each
-        new incumbent is reported, as is each distinct MIP node count
-        HiGHS reports. See `linprog` for the fields and for stopping the
-        solver (status 5).
+        Called from the interrupt events of whichever LP solver HiGHS
+        selects, at most once per distinct iteration count HiGHS reports,
+        and once more after the solver returns. HiGHS chooses which
+        events to raise; presolve may leave only the final call. With
+        `integrality`, each new incumbent is reported, as is each
+        distinct MIP node count HiGHS reports. See `linprog` for the
+        fields and for stopping the solver (status 5).
 
     Options
     -------
@@ -370,11 +372,12 @@ def _linprog_highs_ds_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         :ref:`'simplex' <optimize.linprog-simplex>` (legacy)
         are also available.
     callback : callable, optional
-        Called once per distinct simplex iteration count, and once more
-        after the solver returns. ``phase`` is 2 on the calls made during
-        the solve. See `linprog` for the `OptimizeResult` fields, for the
-        NaN solution reported while HiGHS is running, and for stopping
-        the solver from the callback.
+        Called from simplex interrupt events, at most once per distinct
+        iteration count HiGHS reports, and once more after the solver
+        returns. HiGHS chooses which counts to report. ``phase`` is 2 on
+        the calls made during the solve. See `linprog` for the
+        `OptimizeResult` fields, for the NaN solution reported while
+        HiGHS is running, and for stopping the solver from the callback.
 
     Options
     -------
@@ -619,13 +622,14 @@ def _linprog_highs_ipm_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         :ref:`'simplex' <optimize.linprog-simplex>` (legacy)
         are also available.
     callback : callable, optional
-        Called once per interior-point iteration, and once more after the
-        solver returns. Interrupt events with iteration count -1, which
-        HiGHS raises from crossover and factorization, are not passed to
-        the callback. ``phase`` is 1 on the calls made during the solve.
-        See `linprog` for the `OptimizeResult` fields, for the NaN
-        solution reported while HiGHS is running, and for stopping the
-        solver from the callback.
+        Called from interior-point interrupt events, at most once per
+        distinct iteration count other than -1, and once more after the
+        solver returns. HiGHS chooses which counts to report. Interrupt
+        events with iteration count -1, which HiGHS raises from crossover
+        and factorization, are not passed to the callback. ``phase`` is 1
+        on the calls made during the solve. See `linprog` for the
+        `OptimizeResult` fields, for the NaN solution reported while
+        HiGHS is running, and for stopping the solver from the callback.
 
     Options
     -------

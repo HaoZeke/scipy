@@ -53,18 +53,20 @@ New features
 ===============================
 
 - `scipy.optimize.linprog` now accepts a ``callback`` for the HiGHS
-  methods. ``method='highs-ds'`` calls it once per distinct simplex
-  iteration, ``method='highs-ipm'`` once per interior-point iteration,
-  and ``method='highs'`` follows whichever of those solvers HiGHS runs.
-  Interior-point events reported with iteration count ``-1`` (crossover
-  and factorization) are not passed through. The original solution is
-  not available until the solver returns, when the callback is called
-  once more with that result. Returning ``True`` or raising
-  ``StopIteration`` stops the solve with status 5. Status 4 is unchanged
-  and still reports numerical difficulties. With ``integrality``, each
-  new incumbent is reported with its objective and constraint residuals,
-  and each distinct branch-and-bound node count HiGHS reports is
-  reported as well.
+  methods. While a simplex or interior-point solve is running, the
+  original solution is not available, so ``x``, ``slack``, ``con`` and
+  ``fun`` are NaN. The callback is called again with the returned result
+  after the solver finishes. ``method='highs-ds'`` and
+  ``method='highs-ipm'`` forward that solver's interrupt events, at most
+  once per distinct iteration count HiGHS reports, and ``method='highs'``
+  follows whichever solver runs. How often HiGHS raises those events is
+  up to the solver. Interior-point events reported with iteration count
+  ``-1`` (crossover and factorization) are not passed through. Returning
+  ``True`` or raising ``StopIteration`` stops the solve with status 5.
+  Status 4 is unchanged and still reports numerical difficulties. With
+  ``integrality``, each new incumbent is reported with its objective and
+  constraint residuals, and each distinct branch-and-bound node count
+  HiGHS reports is reported as well.
 
 
 ``scipy.signal`` improvements
