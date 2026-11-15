@@ -269,6 +269,10 @@ def milp(c, *, integrality=None, bounds=None, constraints=None, options=None):
 
             ``4`` : Other; see message for details.
 
+            ``5`` : Interrupted by the callback. `milp` does not accept
+            a callback; this status is shared with `linprog` through the
+            HiGHS status map.
+
         success : bool
             ``True`` when an optimal solution is found and ``False`` otherwise.
 

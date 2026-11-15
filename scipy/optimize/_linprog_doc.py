@@ -102,6 +102,12 @@ def _linprog_highs_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
 
         This argument is currently used only by the ``'highs'`` method and
         ignored otherwise.
+    callback : callable, optional
+        Called for each iteration of whichever LP solver HiGHS selects,
+        and once more after the solver returns. With `integrality`, each
+        new incumbent is reported, as is each distinct MIP node count
+        HiGHS reports. See `linprog` for the fields and for stopping the
+        solver (status 5).
 
     Options
     -------
@@ -197,6 +203,8 @@ def _linprog_highs_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
             ``3`` : Problem appears to be unbounded.
 
             ``4`` : The HiGHS solver ran into a problem.
+
+            ``5`` : The solve was interrupted by the callback.
 
         message : str
             A string descriptor of the exit status of the algorithm.
@@ -361,6 +369,12 @@ def _linprog_highs_ds_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         :ref:`'revised simplex' <optimize.linprog-revised_simplex>`, and
         :ref:`'simplex' <optimize.linprog-simplex>` (legacy)
         are also available.
+    callback : callable, optional
+        Called once per distinct simplex iteration count, and once more
+        after the solver returns. ``phase`` is 2 on the calls made during
+        the solve. See `linprog` for the `OptimizeResult` fields, for the
+        NaN solution reported while HiGHS is running, and for stopping
+        the solver from the callback.
 
     Options
     -------
@@ -440,6 +454,8 @@ def _linprog_highs_ds_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
             ``3`` : Problem appears to be unbounded.
 
             ``4`` : The HiGHS solver ran into a problem.
+
+            ``5`` : The solve was interrupted by the callback.
 
         message : str
             A string descriptor of the exit status of the algorithm.
@@ -602,6 +618,14 @@ def _linprog_highs_ipm_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         :ref:`'revised simplex' <optimize.linprog-revised_simplex>`, and
         :ref:`'simplex' <optimize.linprog-simplex>` (legacy)
         are also available.
+    callback : callable, optional
+        Called once per interior-point iteration, and once more after the
+        solver returns. Interrupt events with iteration count -1, which
+        HiGHS raises from crossover and factorization, are not passed to
+        the callback. ``phase`` is 1 on the calls made during the solve.
+        See `linprog` for the `OptimizeResult` fields, for the NaN
+        solution reported while HiGHS is running, and for stopping the
+        solver from the callback.
 
     Options
     -------
@@ -671,6 +695,8 @@ def _linprog_highs_ipm_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
             ``3`` : Problem appears to be unbounded.
 
             ``4`` : The HiGHS solver ran into a problem.
+
+            ``5`` : The solve was interrupted by the callback.
 
         message : str
             A string descriptor of the exit status of the algorithm.
