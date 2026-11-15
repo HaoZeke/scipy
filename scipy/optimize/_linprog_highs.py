@@ -376,10 +376,16 @@ def _linprog_highs(lp, solver, time_limit=None, presolve=True,
     lb = _replace_inf(lb)
     ub = _replace_inf(ub)
 
-    if integrality is None or np.sum(integrality) == 0:
-        integrality = np.empty(0)
-    else:
+    # Capture this before the continuous case replaces ``integrality``
+    # with an empty array. That empty array is not ``None``, so a later
+    # ``integrality is not None`` test cannot tell an LP from a MIP.
+    # ``np.any(x)`` is also the wrong test: an all-zero incumbent is a
+    # real MIP solution.
+    is_mip = integrality is not None and np.sum(integrality) != 0
+    if is_mip:
         integrality = np.array(integrality)
+    else:
+        integrality = np.empty(0)
 
     res = _highs_wrapper(c, A.indptr, A.indices, A.data, lhs, rhs,
                          lb, ub, integrality.astype(np.uint8), options,
@@ -447,7 +453,7 @@ def _linprog_highs(lp, solver, time_limit=None, presolve=True,
         sol['phase'] = _highs_callback_phase(
             solver, res.get('simplex_nit'), res.get('ipm_nit'))
 
-    if np.any(x) and integrality is not None:
+    if is_mip and x is not None:
         sol.update({
             'mip_node_count': res.get('mip_node_count', 0),
             'mip_dual_bound': res.get('mip_dual_bound', 0.0),

@@ -179,6 +179,17 @@ def linprog_terse_callback(res):
     print(x)
 
 
+def _copy_callback_array(value):
+    """Copy an array passed to the final callback.
+
+    The returned result keeps its own arrays. Writing into the arrays on
+    the callback result must not change the solution `linprog` returns.
+    """
+    if value is None:
+        return None
+    return np.array(value, copy=True)
+
+
 def _invoke_linprog_callback(callback, sol, phase):
     """Deliver the final HiGHS callback, after ``run`` has returned.
 
@@ -188,10 +199,10 @@ def _invoke_linprog_callback(callback, sol, phase):
     """
     nit = sol['nit']
     res = OptimizeResult({
-        'x': sol['x'],
+        'x': _copy_callback_array(sol['x']),
         'fun': sol['fun'],
-        'slack': sol['slack'],
-        'con': sol['con'],
+        'slack': _copy_callback_array(sol['slack']),
+        'con': _copy_callback_array(sol['con']),
         'success': sol['success'],
         'status': sol['status'],
         'nit': 0 if nit is None else int(nit),
@@ -300,27 +311,32 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         simplex iteration.
 
         With `integrality` (``method='highs'`` only), the callback instead
-        follows the MIP solver. Each new incumbent is reported with
-        ``x`` and ``fun`` equal to ``c @ x``, and with ``slack`` and
-        ``con`` computed from that incumbent and the original constraint
-        matrices. Node-progress events carry the same NaN solution fields
-        as an LP interrupt, once per distinct node count HiGHS reports.
-        Both kinds of call set ``phase`` to 2, ``nit`` to the node count,
-        and ``mip_node_count``, ``mip_dual_bound`` and ``mip_gap``. The
-        final call has ``complete`` True and the same solution fields as
-        the returned result, including those MIP fields. Its ``nit`` is
-        the iteration count on that result.
+        follows the MIP solver. Each new incumbent is reported with that
+        point in ``x``, with ``fun`` equal to ``c @ x``, and with
+        ``slack`` and ``con`` computed from that incumbent and the
+        original constraint matrices. Node-progress events carry the same
+        NaN solution fields as an LP interrupt. A node count HiGHS reports
+        more than once is passed through only the first time. Both kinds
+        of call set ``phase`` to 2, ``nit`` to the node count, and
+        ``mip_node_count``, ``mip_dual_bound`` and ``mip_gap``. The final
+        call has ``complete`` True and the same solution fields as the
+        returned result, including those MIP fields when the result has
+        them. Its ``nit`` is the iteration count on that result.
 
-        When the callback runs depends on `method`:
+        When the callback runs depends on `method`. HiGHS chooses which
+        interrupt events to raise, so the number of calls is not the
+        iteration count:
 
-        - ``'highs-ds'``: once per distinct simplex iteration count.
-        - ``'highs-ipm'``: once per interior-point iteration. HiGHS also
-          raises interrupt events with iteration count -1 from crossover
-          and factorization; those events are not passed to the callback.
+        - ``'highs-ds'``: simplex interrupt events, at most once per
+          distinct iteration count HiGHS reports.
+        - ``'highs-ipm'``: interior-point interrupt events, at most once
+          per distinct iteration count other than -1. HiGHS also raises
+          interrupt events with iteration count -1 from crossover and
+          factorization; those events are not passed to the callback.
         - ``'highs'``: the events of whichever of those solvers HiGHS runs.
 
         If presolve solves the model before either of those solvers starts,
-        only the final call is made.
+        no interrupt event is raised and only the final call is made.
 
         Returning ``True`` or raising ``StopIteration`` interrupts the
         HiGHS solver. The returned ``status`` is then 5 and ``message``
