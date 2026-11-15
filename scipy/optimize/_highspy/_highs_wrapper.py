@@ -249,18 +249,24 @@ def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality,
     #                if the objective function value is not Infinity, then the
     #                current solution is feasible and can be returned.  Else, there
     #                is no solution.
-    mipFailCondition = model_status not in (
+    # A MIP interrupt can still carry the postsolved incumbent. Treat it
+    # like the other limits: return that incumbent when the objective is
+    # finite, and withhold it when HiGHS has not found one.
+    mip_with_solution = (
         _h.HighsModelStatus.kOptimal,
         _h.HighsModelStatus.kTimeLimit,
         _h.HighsModelStatus.kIterationLimit,
         _h.HighsModelStatus.kSolutionLimit,
-    ) or (
-        model_status
-        in {
-            _h.HighsModelStatus.kTimeLimit,
-            _h.HighsModelStatus.kIterationLimit,
-            _h.HighsModelStatus.kSolutionLimit,
-        }
+        _h.HighsModelStatus.kInterrupt,
+    )
+    mip_partial = (
+        _h.HighsModelStatus.kTimeLimit,
+        _h.HighsModelStatus.kIterationLimit,
+        _h.HighsModelStatus.kSolutionLimit,
+        _h.HighsModelStatus.kInterrupt,
+    )
+    mipFailCondition = model_status not in mip_with_solution or (
+        model_status in mip_partial
         and (info.objective_function_value == _h.kHighsInf)
     )
     lpFailCondition = model_status != _h.HighsModelStatus.kOptimal
@@ -399,91 +405,111 @@ def _install_highs_callback(highs, callback, n_x, n_slack, n_con, solver,
     seen_ipm = set()
     seen_nodes = set()
 
-    def _request_stop(data_in, kind):
-        stop_requested.append(True)
-        # Improving-solution callbacks must not set user_interrupt.
-        if kind != mip_improv_type and data_in is not None:
-            data_in.user_interrupt = True
+    def _set_user_interrupt(data_in, stop):
+        # HiGHS does not clear ``user_interrupt`` between callbacks.
+        # ``kCallbackMipImprovingSolution`` asserts that it is false, so
+        # every return path has to write the flag explicitly.
+        if data_in is not None:
+            data_in.user_interrupt = bool(stop)
 
     def _highs_callback(callback_type, _message, data_out, data_in, _user_data):
         kind = int(callback_type)
+        # Improving-solution callbacks ignore ``user_interrupt`` and abort
+        # the process in a build with assertions if it is left true.
         honors_stop = kind != mip_improv_type
-        if held_exception:
-            if honors_stop and data_in is not None:
-                data_in.user_interrupt = True
-            return
 
-        improving = False
-        if kind == simplex_type:
-            nit = int(data_out.simplex_iteration_count)
-            if nit in seen_simplex:
-                return
-            seen_simplex.add(nit)
-            phase = 2
-        elif kind == ipm_type:
-            nit = int(data_out.ipm_iteration_count)
-            # Crossover and factorization, not an IPM iteration.
-            if nit == -1 or nit in seen_ipm:
-                return
-            seen_ipm.add(nit)
-            phase = 1
-        elif kind == mip_interrupt_type:
-            nit = int(data_out.mip_node_count)
-            if nit in seen_nodes:
-                if stop_requested and data_in is not None:
-                    data_in.user_interrupt = True
-                return
-            seen_nodes.add(nit)
-            phase = 2
-        elif kind == mip_improv_type:
-            nit = int(data_out.mip_node_count)
-            phase = 2
-            improving = True
-        else:
-            return
+        def _apply_interrupt(stop):
+            if stop:
+                stop_requested.append(True)
+            _set_user_interrupt(
+                data_in, honors_stop and bool(stop_requested))
 
-        x = np.full(n_x, np.nan)
-        fun = float("nan")
-        slack = np.full(n_slack, np.nan)
-        con = np.full(n_con, np.nan)
-        if improving:
-            incumbent = np.array(data_out.mip_solution, dtype=float, copy=True)
-            # The incumbent is stored for the original model. When its
-            # length matches, slack and con are A and b of that model.
-            if incumbent.size == n_x:
-                x = incumbent
-                fun = float(np.dot(np.asarray(c, dtype=float), x))
-                residual = np.asarray(rhs, dtype=float) - _csc_matvec(
-                    indptr, indices, data, x, np.asarray(rhs).size)
-                slack = residual[:n_slack]
-                con = residual[n_slack:n_slack + n_con]
-
-        cb_res = OptimizeResult({
-            "x": x,
-            "fun": fun,
-            "slack": slack,
-            "con": con,
-            "success": False,
-            "status": 0,
-            "nit": int(nit),
-            "message": "",
-            "phase": phase,
-            "complete": False,
-        })
-        if kind in (mip_improv_type, mip_interrupt_type):
-            cb_res["mip_node_count"] = int(data_out.mip_node_count)
-            cb_res["mip_dual_bound"] = float(data_out.mip_dual_bound)
-            cb_res["mip_gap"] = float(data_out.mip_gap)
         try:
-            stop = callback(cb_res) is True
-        except StopIteration:
-            stop = True
+            if held_exception:
+                _set_user_interrupt(data_in, honors_stop)
+                return
+
+            improving = False
+            if kind == simplex_type:
+                nit = int(data_out.simplex_iteration_count)
+                if nit in seen_simplex:
+                    _apply_interrupt(False)
+                    return
+                seen_simplex.add(nit)
+                phase = 2
+            elif kind == ipm_type:
+                nit = int(data_out.ipm_iteration_count)
+                # Crossover and factorization, not an IPM iteration.
+                if nit == -1 or nit in seen_ipm:
+                    _apply_interrupt(False)
+                    return
+                seen_ipm.add(nit)
+                phase = 1
+            elif kind == mip_interrupt_type:
+                nit = int(data_out.mip_node_count)
+                if nit in seen_nodes:
+                    _apply_interrupt(False)
+                    return
+                seen_nodes.add(nit)
+                phase = 2
+            elif kind == mip_improv_type:
+                nit = int(data_out.mip_node_count)
+                phase = 2
+                improving = True
+            else:
+                _apply_interrupt(False)
+                return
+
+            x = np.full(n_x, np.nan)
+            fun = float("nan")
+            slack = np.full(n_slack, np.nan)
+            con = np.full(n_con, np.nan)
+            if improving:
+                incumbent = np.array(
+                    data_out.mip_solution, dtype=float, copy=True)
+                # The incumbent is stored for the original model. When its
+                # length matches, slack and con are A and b of that model.
+                if incumbent.size == n_x:
+                    x = incumbent
+                    fun = float(np.dot(np.asarray(c, dtype=float), x))
+                    residual = np.asarray(rhs, dtype=float) - _csc_matvec(
+                        indptr, indices, data, x, np.asarray(rhs).size)
+                    slack = residual[:n_slack]
+                    con = residual[n_slack:n_slack + n_con]
+
+            cb_res = OptimizeResult({
+                "x": x,
+                "fun": fun,
+                "slack": slack,
+                "con": con,
+                "success": False,
+                "status": 0,
+                "nit": int(nit),
+                "message": "",
+                "phase": phase,
+                "complete": False,
+            })
+            if kind in (mip_improv_type, mip_interrupt_type):
+                cb_res["mip_node_count"] = int(data_out.mip_node_count)
+                cb_res["mip_dual_bound"] = float(data_out.mip_dual_bound)
+                cb_res["mip_gap"] = float(data_out.mip_gap)
+            try:
+                stop = callback(cb_res) is True
+            except StopIteration:
+                stop = True
+            except BaseException as exc:
+                held_exception.append(exc)
+                stop_requested.append(True)
+                _set_user_interrupt(data_in, honors_stop)
+                return
+            _apply_interrupt(stop)
         except BaseException as exc:
+            # IPX catches ``std::exception`` around the solve, which drops
+            # a Python exception that escapes this callback. Store it and
+            # ask the solver to stop so it can be re-raised after ``run``.
             held_exception.append(exc)
-            _request_stop(data_in, kind)
-            return
-        if stop or (stop_requested and honors_stop):
-            _request_stop(data_in, kind)
+            stop_requested.append(True)
+            _set_user_interrupt(data_in, honors_stop)
 
     # ``None`` is an empty std::function and clears any previous callback.
     highs.setCallback(_highs_callback, None)

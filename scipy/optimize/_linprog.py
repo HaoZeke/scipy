@@ -341,11 +341,12 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         Returning ``True`` or raising ``StopIteration`` interrupts the
         HiGHS solver. The returned ``status`` is then 5 and ``message``
         starts with ``Optimization interrupted by callback.`` Status 4
-        remains numerical difficulties. Any other return value is
-        ignored. Any other exception propagates. On the call made after
-        the solver has returned, the solve is already finished:
-        ``StopIteration`` is not propagated and the return value is
-        ignored.
+        remains numerical difficulties. When a mixed-integer solve is
+        interrupted after HiGHS has an incumbent, that incumbent is
+        returned. Any other return value is ignored. Any other exception
+        propagates. On the call made after the solver has returned, the
+        solve is already finished: ``StopIteration`` is not propagated
+        and the return value is ignored.
 
         x : 1-D array
             The current solution vector.

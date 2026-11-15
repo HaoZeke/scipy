@@ -2004,6 +2004,22 @@ class LinprogHiGHSTests(LinprogCommonTests):
         _assert_success(res, desired_fun=-18.0, desired_x=[2, 6])
         assert calls[-1]['complete'] is True
 
+    def test_highs_callback_setup_exception_propagates(self, monkeypatch):
+        # Building the callback result runs inside the HiGHS callback.
+        # IPX catches std::exception, so an exception that escapes here
+        # would come back as status 4 instead of the original error.
+        from scipy.optimize._highspy import _highs_wrapper as wrapper
+
+        def _boom(*args, **kwargs):
+            raise RuntimeError("wrapper blew up")
+
+        monkeypatch.setattr(wrapper.np, "full", _boom)
+        c, A_ub, b_ub, A_eq, b_eq = _callback_problem()
+        with pytest.raises(RuntimeError, match="wrapper blew up"):
+            linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                    callback=lambda res: None, method=self.method,
+                    options={'presolve': False})
+
     @pytest.mark.thread_unsafe(reason="linprog_verbose_callback sets global "
                                 "NumPy print options")
     def test_highs_sample_callbacks(self):
@@ -2825,6 +2841,41 @@ def test_linprog_zero_mip_reports_mip_fields():
         assert key in res
         assert key in seen[-1]
         assert seen[-1][key] == res[key]
+
+
+def test_linprog_mip_callback_stop_keeps_incumbent():
+    # Stopping after an improving solution must not throw that
+    # incumbent away. HiGHS status kInterrupt still has it.
+    c, A_ub, b_ub = _knapsack_problem()
+    seen = []
+
+    def cb(res):
+        if res.complete or res.x is None or np.isnan(res.x).all():
+            return None
+        seen.append(np.array(res.x, copy=True))
+        return True
+
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=(0, 1), integrality=1,
+                  callback=cb, method='highs')
+    assert seen
+    assert res.status == 5
+    assert res.success is False
+    assert res.x is not None
+    assert_allclose(res.fun, float(c @ res.x))
+    assert_allclose(res.slack, b_ub - A_ub @ res.x, atol=1e-8)
+    assert res.fun <= float(c @ seen[-1]) + 1e-8
+    for key in ('mip_node_count', 'mip_dual_bound', 'mip_gap'):
+        assert key in res
+
+
+def test_linprog_mip_nit_not_negative_sentinel():
+    # No LP iterations: the simplex count is 0 and the IPM count is left
+    # at the HiGHS "not run" sentinel. ``0 or -1`` used to report -1.
+    res = linprog(-np.array([1., 1.]), bounds=(0, 1), integrality=1)
+    assert res.nit >= 0
+    assert res.crossover_nit >= 0
+    assert res.success
+    assert_allclose(res.x, [1., 1.])
 
 
 class TestLinprogHiGHSSimplexDual(LinprogHiGHSTests):

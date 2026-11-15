@@ -95,6 +95,18 @@ def _positive_count(value):
     return int(value)
 
 
+def _nonnegative_count(value):
+    """Return ``value`` when it is a count, with HiGHS's -1 sentinel as 0.
+
+    ``None`` stays ``None`` so a missing field is not invented.
+    """
+    if value is None:
+        return None
+    if value < 0:
+        return 0
+    return int(value)
+
+
 def _highs_callback_phase(solver, simplex_nit, ipm_nit):
     """Phase of the solver whose iteration count `linprog` reports.
 
@@ -445,8 +457,12 @@ def _linprog_highs(lp, solver, time_limit=None, presolve=True,
            'status': status,
            'success': res['status'] == HighsModelStatus.kOptimal,
            'message': message,
-           'nit': res.get('simplex_nit', 0) or res.get('ipm_nit', 0),
-           'crossover_nit': res.get('crossover_nit'),
+           # HiGHS uses -1 as "not run". ``0 or -1`` would report that
+           # sentinel whenever the simplex count is zero, which is the
+           # usual MIP result when the search never calls the LP solver.
+           'nit': (_positive_count(res.get('simplex_nit'))
+                   or _positive_count(res.get('ipm_nit'))),
+           'crossover_nit': _nonnegative_count(res.get('crossover_nit')),
            }
 
     if callback is not None:

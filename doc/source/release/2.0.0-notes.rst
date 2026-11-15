@@ -66,7 +66,8 @@ New features
   Status 4 is unchanged and still reports numerical difficulties. With
   ``integrality``, each new incumbent is reported with its objective and
   constraint residuals, and each distinct branch-and-bound node count
-  HiGHS reports is reported as well.
+  HiGHS reports is reported as well. Interrupting a mixed-integer solve
+  returns that incumbent when HiGHS has one.
 
 
 ``scipy.signal`` improvements
