@@ -1439,6 +1439,7 @@ def _check_result(x, fun, status, slack, con, bounds, tol, message,
              2 : Problem appears to be infeasible
              3 : Problem appears to be unbounded
              4 : Serious numerical difficulties encountered
+             5 : The solve was interrupted by the callback
 
     slack : 1-D array
         The (non-negative) slack in the upper bound constraints, that is,
@@ -1463,6 +1464,7 @@ def _check_result(x, fun, status, slack, con, bounds, tol, message,
              2 : Problem appears to be infeasible
              3 : Problem appears to be unbounded
              4 : Serious numerical difficulties encountered
+             5 : The solve was interrupted by the callback
 
     message : str
         A string descriptor of the exit status of the optimization.

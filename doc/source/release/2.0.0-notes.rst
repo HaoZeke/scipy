@@ -52,6 +52,15 @@ New features
 ``scipy.optimize`` improvements
 ===============================
 
+- `scipy.optimize.linprog` now accepts a ``callback`` for the HiGHS
+  methods. While a simplex or interior-point solve is running, ``x``,
+  ``slack``, ``con`` and ``fun`` are NaN, and the callback is called
+  again with the returned result after the solver finishes. Returning
+  ``True`` or raising ``StopIteration`` stops the solve with status 5.
+  With ``integrality``, new incumbents and branch-and-bound progress are
+  reported, and an interrupted solve keeps the incumbent when HiGHS has
+  one.
+
 
 ``scipy.signal`` improvements
 =============================

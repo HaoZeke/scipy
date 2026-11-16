@@ -269,6 +269,8 @@ def milp(c, *, integrality=None, bounds=None, constraints=None, options=None):
 
             ``4`` : Other; see message for details.
 
+            ``5`` : Interrupted. `milp` does not accept a callback.
+
         success : bool
             ``True`` when an optimal solution is found and ``False`` otherwise.
 

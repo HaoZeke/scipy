@@ -209,6 +209,8 @@ def _linprog_highs(lp, solver, time_limit=None, presolve=True,
 
                 ``4`` : The HiGHS solver ran into a problem.
 
+                ``5`` : The solve was interrupted by the callback.
+
             message : str
                 A string descriptor of the exit status of the algorithm.
             nit : int

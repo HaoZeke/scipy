@@ -80,6 +80,8 @@ def linprog_verbose_callback(res):
 
             ``4`` : Serious numerical difficulties encountered
 
+            ``5`` : The solve was interrupted by the callback
+
         nit : int
             The number of iterations performed.
         message : str
@@ -160,6 +162,8 @@ def linprog_terse_callback(res):
             ``3`` : Problem appears to be unbounded
 
             ``4`` : Serious numerical difficulties encountered
+
+            ``5`` : The solve was interrupted by the callback
 
         nit : int
             The number of iterations performed.
@@ -249,9 +253,38 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         The legacy methods are deprecated and will be removed in a future
         version of SciPy.
     callback : callable, optional
-        If a callback function is provided, it will be called at least once per
-        iteration of the algorithm. The callback function must accept a single
-        `scipy.optimize.OptimizeResult` consisting of the following fields:
+        Called with one `OptimizeResult` of the fields below. Legacy
+        methods call it at least once per iteration. HiGHS methods call
+        it when HiGHS raises an interrupt, and once more after the solver
+        returns with copies of the returned result (``complete`` True).
+
+        While simplex or interior point is running, the original solution
+        is not available: ``x``, ``slack`` and ``con`` are NaN arrays of
+        the original shapes and ``fun`` is NaN. ``phase`` is 1 for an
+        interior-point event and 2 for a simplex event. HiGHS uses -1 for
+        an unknown iteration count; those events are not passed through.
+        ``method='highs-ds'`` listens to the simplex, ``method='highs-ipm'``
+        to the interior-point method, and ``method='highs'`` to whichever
+        of the two runs. Presolve can finish the model before either
+        starts, in which case only the final call is made.
+
+        With `integrality` (``method='highs'`` only) each new incumbent is
+        reported with ``fun`` equal to ``c @ x`` and with ``slack`` and
+        ``con`` from that point, and branch-and-bound progress is reported
+        with the NaN solution. Those calls set ``phase`` to 2 and include
+        ``mip_node_count``, ``mip_dual_bound`` and ``mip_gap``. A progress
+        event with node count -1 is not passed through. An incumbent with
+        that count is still reported, with the count as 0. The MIP fields
+        are absent unless the problem is a real MIP. Neither call reports
+        -1 as ``nit``.
+
+        Return ``True`` or raise ``StopIteration`` to stop the solve.
+        The returned status is then 5 and ``message`` starts with
+        ``Optimization interrupted by callback.`` Status 4 remains
+        numerical difficulties. Stopping a MIP keeps the incumbent when
+        HiGHS has one. Any other return value is ignored. Any other
+        exception is raised after the solve. On the final call the
+        return value is ignored and ``StopIteration`` does not propagate.
 
         x : 1-D array
             The current solution vector.
@@ -280,12 +313,14 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
 
             ``4`` : Numerical difficulties encountered.
 
+            ``5`` : The solve was interrupted by the callback.
+
         nit : int
             The current iteration number.
         message : str
             A string descriptor of the algorithm status.
-
-        Callback functions are not currently supported by the HiGHS methods.
+        complete : bool
+            ``True`` on the call made after the solver has returned.
 
     options : dict, optional
         A dictionary of solver options. All methods accept the following
@@ -410,6 +445,8 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
 
             ``4`` : Numerical difficulties encountered.
 
+            ``5`` : The solve was interrupted by the callback.
+
         nit : int
             The total number of iterations performed in all phases.
         message : str
@@ -431,8 +468,8 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
     the two automatically. These are the fastest linear
     programming solvers in SciPy, especially for large, sparse problems;
     which of these two is faster is problem-dependent.
-    The other solvers are legacy methods and will be removed when `callback` is
-    supported by the HiGHS methods.
+    The other solvers are legacy methods and will be removed in a future
+    version of SciPy.
 
     Method :ref:`'highs-ds' <optimize.linprog-highs-ds>`, is a wrapper of the C++ high
     performance dual revised simplex implementation (HSOL) [13]_, [14]_.
@@ -622,6 +659,23 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
     >>> b[0] -= 39
     >>> linprog(c, A_ub=A, b_ub=b, bounds=[x0_bounds, x1_bounds]).fun
     -22.0
+
+    Returning ``True`` from the callback interrupts the HiGHS solver.
+    The result status is 5, not 4:
+
+    >>> def stop(_res):
+    ...     return True
+    >>> interrupted = linprog(
+    ...     [-1, 4], A_ub=[[-3, 1], [1, 2]], b_ub=[6, 4],
+    ...     bounds=[(None, None), (-3, None)], callback=stop,
+    ...     options={'presolve': False})
+    >>> interrupted.status
+    5
+    >>> interrupted.success
+    False
+    >>> interrupted.message.startswith(
+    ...     'Optimization interrupted by callback.')
+    True
 
     """
 
