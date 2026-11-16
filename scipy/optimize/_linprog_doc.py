@@ -102,6 +102,8 @@ def _linprog_highs_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
 
         This argument is currently used only by the ``'highs'`` method and
         ignored otherwise.
+    callback : callable, optional
+        See `linprog`.
 
     Options
     -------
@@ -361,6 +363,8 @@ def _linprog_highs_ds_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         :ref:`'revised simplex' <optimize.linprog-revised_simplex>`, and
         :ref:`'simplex' <optimize.linprog-simplex>` (legacy)
         are also available.
+    callback : callable, optional
+        See `linprog`.
 
     Options
     -------
@@ -602,6 +606,8 @@ def _linprog_highs_ipm_doc(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         :ref:`'revised simplex' <optimize.linprog-revised_simplex>`, and
         :ref:`'simplex' <optimize.linprog-simplex>` (legacy)
         are also available.
+    callback : callable, optional
+        See `linprog`.
 
     Options
     -------
