@@ -198,6 +198,12 @@ def _invoke_linprog_callback(callback, sol, phase):
     from this call. Any other exception is.
     """
     nit = sol['nit']
+    # The result count is already nonnegative. Clamp here as well so a
+    # HiGHS -1 sentinel cannot be reported on the final call.
+    if nit is None or int(nit) < 0:
+        nit = 0
+    else:
+        nit = int(nit)
     res = OptimizeResult({
         'x': _copy_callback_array(sol['x']),
         'fun': sol['fun'],
@@ -205,7 +211,7 @@ def _invoke_linprog_callback(callback, sol, phase):
         'con': _copy_callback_array(sol['con']),
         'success': sol['success'],
         'status': sol['status'],
-        'nit': 0 if nit is None else int(nit),
+        'nit': nit,
         'message': sol['message'],
         'phase': phase,
         'complete': True,
@@ -318,10 +324,15 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
         NaN solution fields as an LP interrupt. A node count HiGHS reports
         more than once is passed through only the first time. Both kinds
         of call set ``phase`` to 2, ``nit`` to the node count, and
-        ``mip_node_count``, ``mip_dual_bound`` and ``mip_gap``. The final
+        ``mip_node_count``, ``mip_dual_bound`` and ``mip_gap``. HiGHS
+        uses -1 for an unknown node count. A node-progress event with
+        that count is not passed through. An improving solution with
+        that count is still reported, with ``nit`` and ``mip_node_count``
+        of 0. The final
         call has ``complete`` True and the same solution fields as the
         returned result, including those MIP fields when the result has
-        them. Its ``nit`` is the iteration count on that result.
+        them. Its ``nit`` is the iteration count on that result. Neither
+        call reports the -1 sentinel as ``nit``.
 
         When the callback runs depends on `method`. HiGHS chooses which
         interrupt events to raise, so the number of calls is not the

@@ -470,8 +470,13 @@ def _linprog_highs(lp, solver, time_limit=None, presolve=True,
             solver, res.get('simplex_nit'), res.get('ipm_nit'))
 
     if is_mip and x is not None:
+        # ``mip_node_count`` uses the same -1 unknown sentinel as the
+        # LP iteration counts. The final callback copies this field.
+        node_count = res.get('mip_node_count', 0)
+        if node_count is None or node_count < 0:
+            node_count = 0
         sol.update({
-            'mip_node_count': res.get('mip_node_count', 0),
+            'mip_node_count': node_count,
             'mip_dual_bound': res.get('mip_dual_bound', 0.0),
             'mip_gap': res.get('mip_gap', 0.0),
         })

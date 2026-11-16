@@ -330,6 +330,19 @@ def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality,
     return _finish_callback_status(res, stop_requested)
 
 
+def _known_count(value):
+    """Return a HiGHS count, or None for the -1 unknown sentinel.
+
+    Iteration counts and ``mip_node_count`` are initialized to -1 and
+    stay there until the solver has a real count. That sentinel is not
+    an iteration and must not be reported as ``nit``.
+    """
+    value = int(value)
+    if value < 0:
+        return None
+    return value
+
+
 def _finish_callback_status(res, stop_requested):
     """Report a callback stop as HiGHS status ``kInterrupt``.
 
@@ -383,9 +396,13 @@ def _install_highs_callback(highs, callback, n_x, n_slack, n_con, solver,
     A mixed-integer solve listens to ``kCallbackMipImprovingSolution``
     (each new incumbent, in the original variable space) and
     ``kCallbackMipInterrupt`` (``checkLimits``, once per distinct node
-    count). HiGHS asserts that an improving-solution callback does not
-    set ``user_interrupt``; a stop requested there is applied on the
-    next interrupt event. Logging callbacks are never started.
+    count). ``clearHighsCallbackOutput`` sets the node count to -1, and
+    the LP iteration fields on those events are left at that sentinel.
+    A node event with an unknown count is not a node and is dropped. An
+    improving solution is still delivered; its count is reported as 0.
+    HiGHS asserts that an improving-solution callback does not set
+    ``user_interrupt``; a stop requested there is applied on the next
+    interrupt event. Logging callbacks are never started.
     """
     cb = _h.cb.HighsCallbackType
     simplex_type = int(cb.kCallbackSimplexInterrupt)
@@ -431,29 +448,37 @@ def _install_highs_callback(highs, callback, n_x, n_slack, n_con, solver,
 
             improving = False
             if kind == simplex_type:
-                nit = int(data_out.simplex_iteration_count)
-                if nit in seen_simplex:
+                nit = _known_count(data_out.simplex_iteration_count)
+                # Same unknown sentinel as an IPM crossover event.
+                if nit is None or nit in seen_simplex:
                     _apply_interrupt(False)
                     return
                 seen_simplex.add(nit)
                 phase = 2
             elif kind == ipm_type:
-                nit = int(data_out.ipm_iteration_count)
+                nit = _known_count(data_out.ipm_iteration_count)
                 # Crossover and factorization, not an IPM iteration.
-                if nit == -1 or nit in seen_ipm:
+                if nit is None or nit in seen_ipm:
                     _apply_interrupt(False)
                     return
                 seen_ipm.add(nit)
                 phase = 1
             elif kind == mip_interrupt_type:
-                nit = int(data_out.mip_node_count)
-                if nit in seen_nodes:
+                nit = _known_count(data_out.mip_node_count)
+                # -1 is "unknown", not a node. Do not record it: a later
+                # real count, including 0, still has to be delivered.
+                if nit is None or nit in seen_nodes:
                     _apply_interrupt(False)
                     return
                 seen_nodes.add(nit)
                 phase = 2
             elif kind == mip_improv_type:
-                nit = int(data_out.mip_node_count)
+                nit = _known_count(data_out.mip_node_count)
+                # The incumbent is real even when HiGHS has not filled
+                # in a node count. Report that sentinel as 0, matching
+                # the LP iteration count on the returned result.
+                if nit is None:
+                    nit = 0
                 phase = 2
                 improving = True
             else:
@@ -490,7 +515,8 @@ def _install_highs_callback(highs, callback, n_x, n_slack, n_con, solver,
                 "complete": False,
             })
             if kind in (mip_improv_type, mip_interrupt_type):
-                cb_res["mip_node_count"] = int(data_out.mip_node_count)
+                # ``nit`` is already the sanitized node count.
+                cb_res["mip_node_count"] = nit
                 cb_res["mip_dual_bound"] = float(data_out.mip_dual_bound)
                 cb_res["mip_gap"] = float(data_out.mip_gap)
             try:
