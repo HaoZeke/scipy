@@ -4,10 +4,11 @@ import numpy as np
 import scipy.optimize._highspy._core as _h
 # pyrefly: ignore[missing-module-attribute]
 from scipy.optimize._highspy import _highs_options as hopt
-from scipy.optimize._optimize import OptimizeWarning
+from scipy.optimize._optimize import OptimizeResult, OptimizeWarning
 
 
-def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality, options):
+def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality,
+                   options, callback=None, A=None, n_slack=0):
     '''Solve linear programs using HiGHS [1]_.
 
     Assume problems of the form:
@@ -203,8 +204,15 @@ def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality, opti
         )
         return res
 
-    # Solve the LP
+    # No callback is registered unless the caller supplied one.
+    state = None
+    if callback is not None:
+        state = _listen(highs, callback, c, A, rhs, numcol, n_slack,
+                        options.get("solver"), isMip)
+
     run_status = highs.run()
+    if state is not None and state["exc"] is not None:
+        raise state["exc"]
     if run_status == _h.HighsStatus.kError:
         res.update(
             {
@@ -212,7 +220,7 @@ def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality, opti
                 "message": highs.modelStatusToString(highs.getModelStatus()),
             }
         )
-        return res
+        return _callback_stop(res, state)
 
     # Extract what we need from the solution
     model_status = highs.getModelStatus()
@@ -229,17 +237,20 @@ def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality, opti
     #                if the objective function value is not Infinity, then the
     #                current solution is feasible and can be returned.  Else, there
     #                is no solution.
+    # An interrupted MIP keeps a finite incumbent, like the other limits.
     mipFailCondition = model_status not in (
         _h.HighsModelStatus.kOptimal,
         _h.HighsModelStatus.kTimeLimit,
         _h.HighsModelStatus.kIterationLimit,
         _h.HighsModelStatus.kSolutionLimit,
+        _h.HighsModelStatus.kInterrupt,
     ) or (
         model_status
         in {
             _h.HighsModelStatus.kTimeLimit,
             _h.HighsModelStatus.kIterationLimit,
             _h.HighsModelStatus.kSolutionLimit,
+            _h.HighsModelStatus.kInterrupt,
         }
         and (info.objective_function_value == _h.kHighsInf)
     )
@@ -257,7 +268,7 @@ def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality, opti
                 "crossover_nit": info.crossover_iteration_count,
             }
         )
-        return res
+        return _callback_stop(res, state)
 
     # Should be safe to read the solution:
     solution = highs.getSolution()
@@ -301,7 +312,130 @@ def _highs_wrapper(c, indptr, indices, data, lhs, rhs, lb, ub, integrality, opti
             }
         )
 
+    return _callback_stop(res, state)
+
+
+def _known_count(value):
+    # HiGHS initializes counts to -1 and leaves them there until it has one.
+    value = int(value)
+    return None if value < 0 else value
+
+
+def _callback_stop(res, state):
+    # An improving-solution callback cannot set the HiGHS interrupt, so a
+    # stop requested there is applied here if the solve returns first.
+    if state is not None and state["stop"]:
+        res["status"] = _h.HighsModelStatus.kInterrupt
+        res["message"] = "Interrupted by user"
     return res
+
+
+def _listen(highs, callback, c, A, rhs, n_x, n_slack, solver, is_mip):
+    """Register ``callback`` and return the mutable solve state.
+
+    Simplex and interior-point callbacks see each iteration count once.
+    A count of -1 is unknown (crossover, factorization, or an unfilled
+    MIP node count) and is not an event, except on an improving solution,
+    which is still delivered with that count reported as 0. An improving
+    solution must leave ``user_interrupt`` false. Exceptions are stored:
+    IPX would otherwise turn one that escapes into a numerical failure.
+    """
+    kinds = _h.cb.HighsCallbackType
+    simplex = int(kinds.kCallbackSimplexInterrupt)
+    ipm = int(kinds.kCallbackIpmInterrupt)
+    mip_improv = int(kinds.kCallbackMipImprovingSolution)
+    mip_node = int(kinds.kCallbackMipInterrupt)
+    if is_mip:
+        active = (kinds.kCallbackMipImprovingSolution,
+                  kinds.kCallbackMipInterrupt)
+    elif solver == "ipm":
+        active = (kinds.kCallbackIpmInterrupt,)
+    elif solver == "simplex":
+        active = (kinds.kCallbackSimplexInterrupt,)
+    else:
+        active = (kinds.kCallbackSimplexInterrupt, kinds.kCallbackIpmInterrupt)
+
+    seen = {simplex: set(), ipm: set(), mip_node: set()}
+    state = {"exc": None, "stop": False}
+    n_con = int(np.asarray(rhs).size) - n_slack
+
+    def _highs_callback(callback_type, _message, data_out, data_in, _user):
+        report_stop = True
+        stop = False
+        try:
+            kind = int(callback_type)
+            # HiGHS does not clear user_interrupt, and asserts that an
+            # improving-solution callback leaves it false.
+            report_stop = kind != mip_improv
+            if state["exc"] is not None:
+                return
+            improving = False
+            if kind == simplex:
+                nit = _known_count(data_out.simplex_iteration_count)
+                phase = 2
+            elif kind == ipm:
+                nit = _known_count(data_out.ipm_iteration_count)
+                phase = 1
+            elif kind == mip_node:
+                nit = _known_count(data_out.mip_node_count)
+                phase = 2
+            elif kind == mip_improv:
+                nit = _known_count(data_out.mip_node_count)
+                if nit is None:
+                    nit = 0
+                phase = 2
+                improving = True
+            else:
+                return
+            if not improving and (nit is None or nit in seen[kind]):
+                return
+            if not improving:
+                seen[kind].add(nit)
+
+            x = np.full(n_x, np.nan)
+            fun = np.nan
+            slack = np.full(n_slack, np.nan)
+            con = np.full(n_con, np.nan)
+            if improving:
+                incumbent = np.array(data_out.mip_solution, dtype=float,
+                                     copy=True)
+                if incumbent.size == n_x:
+                    x = incumbent
+                    fun = float(np.dot(np.asarray(c, dtype=float), x))
+                    residual = np.asarray(rhs, dtype=float) - (A @ x)
+                    slack = residual[:n_slack]
+                    con = residual[n_slack:]
+            result = OptimizeResult({
+                "x": x,
+                "fun": fun,
+                "slack": slack,
+                "con": con,
+                "success": False,
+                "status": 0,
+                "nit": int(nit),
+                "message": "",
+                "phase": phase,
+                "complete": False,
+            })
+            if is_mip:
+                result["mip_node_count"] = int(nit)
+                result["mip_dual_bound"] = float(data_out.mip_dual_bound)
+                result["mip_gap"] = float(data_out.mip_gap)
+            stop = callback(result) is True
+        except StopIteration:
+            stop = True
+        except BaseException as exc:
+            state["exc"] = exc
+            stop = True
+        finally:
+            if stop:
+                state["stop"] = True
+            data_in.user_interrupt = bool(report_stop and state["stop"])
+
+    highs.setCallback(_highs_callback, None)
+    for kind in active:
+        highs.startCallback(kind)
+    return state
 
 
 def check_option(highs_inst, option, value):

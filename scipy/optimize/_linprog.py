@@ -652,19 +652,40 @@ def linprog(c, A_ub=None, b_ub=None, A_eq=None, b_eq=None,
 
     # Give unmodified problem to HiGHS
     if meth.startswith('highs'):
-        if callback is not None:
-            raise NotImplementedError("HiGHS solvers do not support the "
-                                      "callback interface.")
         highs_solvers = {'highs-ipm': 'ipm', 'highs-ds': 'simplex',
                          'highs': None}
 
         sol = _linprog_highs(lp, solver=highs_solvers[meth],
-                             **solver_options)
+                             callback=callback, **solver_options)
+        phase = sol.pop('phase', None)
         sol['status'], sol['message'] = (
             _check_result(sol['x'], sol['fun'], sol['status'], sol['slack'],
                           sol['con'], lp.bounds, tol, sol['message'],
                           integrality))
         sol['success'] = sol['status'] == 0
+        if callback is not None:
+            # Copies: writing into the callback arrays must not change
+            # the solution `linprog` returns. StopIteration only stops
+            # a solve that is still running.
+            fields = {
+                'fun': sol['fun'],
+                'success': sol['success'],
+                'status': sol['status'],
+                'nit': sol['nit'],
+                'message': sol['message'],
+                'phase': phase,
+                'complete': True,
+            }
+            for key in ('x', 'slack', 'con'):
+                value = sol[key]
+                fields[key] = None if value is None else np.copy(value)
+            for key in ('mip_node_count', 'mip_dual_bound', 'mip_gap'):
+                if key in sol:
+                    fields[key] = sol[key]
+            try:
+                callback(OptimizeResult(fields))
+            except StopIteration:
+                pass
         return OptimizeResult(sol)
 
     warn(f"`method='{meth}'` is deprecated and will be removed in a future version "

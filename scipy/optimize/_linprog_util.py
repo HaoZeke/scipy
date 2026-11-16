@@ -1470,6 +1470,10 @@ def _check_result(x, fun, status, slack, con, bounds, tol, message,
     # Somewhat arbitrary
     tol = np.sqrt(tol) * 10
 
+    # An interrupted solve is not a numerical failure.
+    if status == 5:
+        return status, message
+
     if x is None:
         # HiGHS does not provide x if infeasible/unbounded
         if status == 0:  # Observed with HiGHS Simplex Primal
