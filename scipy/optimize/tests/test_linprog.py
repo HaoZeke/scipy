@@ -11,7 +11,7 @@ from numpy.exceptions import VisibleDeprecationWarning
 from numpy.testing import (assert_, assert_allclose, assert_equal,
                            assert_array_less)
 from pytest import raises as assert_raises
-from scipy.optimize import linprog, OptimizeWarning
+from scipy.optimize import linprog, milp, OptimizeWarning
 from scipy.optimize._numdiff import approx_derivative
 from scipy.sparse.linalg import MatrixRankWarning
 from scipy.linalg import LinAlgWarning
@@ -348,6 +348,15 @@ def test_highs_status_message():
     msg = "HiGHS did not provide a status code. (HiGHS Status None: None)"
     assert status == 4
     assert message.startswith(msg)
+
+    from scipy.optimize._highspy._core import HighsModelStatus
+    status, message = _highs_to_scipy_status_message(
+        HighsModelStatus.kSolveError, "solve error")
+    assert status == 4
+    status, message = _highs_to_scipy_status_message(
+        HighsModelStatus.kInterrupt, "Interrupted by user")
+    assert status == 5
+    assert message.startswith("Optimization interrupted by callback.")
 
 
 def test_bug_17380():
@@ -1789,16 +1798,7 @@ class LinprogRSTests(LinprogCommonTests):
 
 class LinprogHiGHSTests(LinprogCommonTests):
     def test_callback(self):
-        # this is the problem from test_callback
-        def cb(res):
-            return None
-        c = np.array([-3, -2])
-        A_ub = [[2, 1], [1, 1], [1, 0]]
-        b_ub = [10, 8, 4]
-        assert_raises(NotImplementedError, linprog, c, A_ub=A_ub, b_ub=b_ub,
-                      callback=cb, method=self.method)
-        res = linprog(c, A_ub=A_ub, b_ub=b_ub, method=self.method)
-        _assert_success(res, desired_fun=-18.0, desired_x=[2, 6])
+        generic_callback_test(self)
 
     @pytest.mark.parametrize("options",
                              [{"maxiter": -1},
@@ -2307,6 +2307,397 @@ class TestLinprogRSCommon(LinprogRSTests):
 
 class TestLinprogRSBland(LinprogRSTests):
     options = {"pivot": "bland"}
+
+
+def _callback_lp():
+    # x = [2, 6] is optimal, so slack and con are both nonempty.
+    c = np.array([-3.0, -2.0])
+    A_ub = np.array([[2.0, 1.0], [1.0, 1.0], [1.0, 0.0]])
+    b_ub = np.array([10.0, 8.0, 4.0])
+    A_eq = np.array([[1.0, 1.0]])
+    b_eq = np.array([8.0])
+    return c, A_ub, b_ub, A_eq, b_eq
+
+
+def _callback_fields(res):
+    """The legacy callback fields, plus MIP fields when the result has them."""
+    out = {}
+    for key in ("x", "slack", "con"):
+        value = res[key]
+        out[key] = None if value is None else np.array(value, copy=True)
+    out["fun"] = None if res.fun is None else float(res.fun)
+    for key in ("success", "status", "nit", "message", "phase", "complete"):
+        out[key] = res[key]
+    for key in ("mip_node_count", "mip_dual_bound", "mip_gap"):
+        if key in res:
+            out[key] = res[key]
+    return out
+
+
+_HIGHS_METHODS = ("highs", "highs-ds", "highs-ipm")
+
+
+@pytest.mark.parametrize("method", _HIGHS_METHODS)
+def test_highs_callback_fields(method):
+    # Legacy fields, NaN mid-solve arrays, and one final call with copies.
+    c, A_ub, b_ub, A_eq, b_eq = _callback_lp()
+    calls = []
+    final_ids = {}
+
+    def cb(res):
+        calls.append(_callback_fields(res))
+        for key in ("mip_node_count", "mip_dual_bound", "mip_gap"):
+            assert key not in res
+        if res.complete and res.x is not None:
+            final_ids["x"] = res.x
+            res.x[...] = 0
+            res.slack[...] = 0
+            res.con[...] = 0
+
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, callback=cb,
+                  method=method, options={"presolve": False})
+    _assert_success(res, desired_fun=-18.0, desired_x=[2, 6])
+    assert "mip_node_count" not in res
+    assert sum(call["complete"] for call in calls) == 1
+    final = calls[-1]
+    assert final["complete"] is True
+    assert final["success"] is res.success
+    assert final["status"] == res.status
+    assert final["nit"] == res.nit
+    assert final["message"] == res.message
+    assert_allclose(final["x"], res.x)
+    assert_allclose(final["fun"], res.fun)
+    assert_allclose(final["slack"], res.slack)
+    assert_allclose(final["con"], res.con)
+    assert final_ids["x"] is not res.x
+    assert len(calls) >= 2
+    for mid in calls[:-1]:
+        assert mid["complete"] is False
+        assert mid["success"] is False
+        assert mid["status"] == 0
+        assert mid["message"] == ""
+        assert isinstance(mid["nit"], int) and mid["nit"] >= 0
+        assert mid["x"].shape == (c.size,)
+        assert mid["slack"].shape == (b_ub.size,)
+        assert mid["con"].shape == (b_eq.size,)
+        assert np.isnan(mid["x"]).all()
+        assert np.isnan(mid["fun"])
+        assert np.isnan(mid["slack"]).all()
+        assert np.isnan(mid["con"]).all()
+        if method == "highs-ipm":
+            assert mid["phase"] == 1
+        elif method == "highs-ds":
+            assert mid["phase"] == 2
+        else:
+            assert mid["phase"] in (1, 2)
+    if method == "highs-ipm":
+        assert final["phase"] == 1
+    elif method == "highs-ds":
+        assert final["phase"] == 2
+    else:
+        assert final["phase"] in (1, 2)
+    for phase in (1, 2):
+        nits = [call["nit"] for call in calls[:-1] if call["phase"] == phase]
+        assert len(nits) == len(set(nits))
+
+    calls.clear()
+    res = linprog([1.0, -2.0], bounds=[(0, 1), (0, 1)], callback=cb,
+                  method=method, options={"presolve": False})
+    _assert_success(res, desired_fun=-2.0, desired_x=[0, 1])
+    for call in calls:
+        assert call["slack"].shape == (0,)
+        assert call["con"].shape == (0,)
+
+    calls.clear()
+    res = linprog([1.0], bounds=(1, -1), callback=cb, method=method)
+    _assert_infeasible(res)
+    assert calls[-1]["complete"] is True
+    assert calls[-1]["x"] is None
+    assert calls[-1]["status"] == 2
+
+
+@pytest.mark.parametrize("method", _HIGHS_METHODS)
+def test_highs_callback_stop(method):
+    c, A_ub, b_ub, A_eq, b_eq = _callback_lp()
+    opts = {"presolve": False}
+
+    def solve(callback):
+        return linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                       callback=callback, method=method, options=opts)
+
+    def assert_stopped(res):
+        assert res.status == 5
+        assert res.success is False
+        assert res.message.startswith(
+            "Optimization interrupted by callback.")
+
+    seen = []
+
+    def stop_true(res):
+        seen.append(res.complete)
+        return True
+
+    assert_stopped(solve(stop_true))
+    assert any(not complete for complete in seen)
+    assert seen[-1] is True
+
+    def stop_iter(res):
+        raise StopIteration
+
+    assert_stopped(solve(stop_iter))
+
+    def truthy(res):
+        return 1
+
+    _assert_success(solve(truthy), desired_fun=-18.0, desired_x=[2, 6])
+
+    def final_true(res):
+        if res.complete:
+            return True
+
+    _assert_success(solve(final_true), desired_fun=-18.0, desired_x=[2, 6])
+
+    def final_iter(res):
+        if res.complete:
+            raise StopIteration
+
+    _assert_success(solve(final_iter), desired_fun=-18.0, desired_x=[2, 6])
+
+
+@pytest.mark.thread_unsafe(reason="replaces np.full during a HiGHS callback")
+@pytest.mark.parametrize("method", _HIGHS_METHODS)
+def test_highs_callback_exception(method, monkeypatch):
+    c, A_ub, b_ub, A_eq, b_eq = _callback_lp()
+    opts = {"presolve": False}
+
+    def solve(callback):
+        return linprog(c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq,
+                       callback=callback, method=method, options=opts)
+
+    def fail(res):
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        solve(fail)
+
+    def fail_final(res):
+        if res.complete:
+            raise RuntimeError("final callback failed")
+
+    with pytest.raises(RuntimeError, match="final callback failed"):
+        solve(fail_final)
+
+    # An exception while building the callback result must be re-raised.
+    # IPX turns one that escapes the callback into status 4.
+    if method == "highs-ipm":
+        from scipy.optimize._highspy import _highs_wrapper as wrapper
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("wrapper blew up")
+
+        monkeypatch.setattr(wrapper.np, "full", boom)
+        with pytest.raises(RuntimeError, match="wrapper blew up"):
+            solve(lambda res: None)
+
+
+def test_linprog_mip_callback():
+    # Incumbent and node events, MIP fields only for a real MIP, and a
+    # stop that keeps the incumbent.
+    value = np.array([6., 5., 8., 9., 6., 7., 3., 6.])
+    weight = np.array([2., 3., 6., 7., 5., 9., 4., 5.])
+    c = -value
+    A_ub = scipy.sparse.csc_array(weight.reshape(1, -1))
+    b_ub = np.array([15.])
+    calls = []
+
+    def cb(res):
+        calls.append(res)
+
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=(0, 1), integrality=1,
+                  callback=cb, method="highs")
+    _assert_success(res)
+    assert calls[-1].complete is True
+    assert calls[-1].nit == res.nit
+    assert res.nit >= 0
+    assert res.crossover_nit >= 0
+    for key in ("mip_node_count", "mip_dual_bound", "mip_gap"):
+        assert calls[-1][key] == res[key]
+    assert res.mip_node_count >= 0
+    nodes = []
+    for mid in calls[:-1]:
+        assert mid.complete is False
+        assert mid.success is False
+        assert mid.status == 0
+        assert mid.phase == 2
+        assert isinstance(mid.nit, int) and mid.nit >= 0
+        assert mid.mip_node_count == mid.nit
+        assert mid.x.shape == (c.size,)
+        assert mid.slack.shape == (b_ub.size,)
+        assert mid.con.shape == (0,)
+        if np.isnan(mid.x).all():
+            assert np.isnan(mid.fun)
+            assert np.isnan(mid.slack).all()
+            nodes.append(mid.nit)
+        else:
+            assert_allclose(mid.fun, float(c @ mid.x))
+            assert_allclose(mid.slack, np.ravel(b_ub - A_ub @ mid.x))
+    assert len(nodes) == len(set(nodes))
+
+    calls.clear()
+    c_eq = np.array([-1.0, 0.0])
+    A_eq = np.array([[1.0, 1.0]])
+    b_eq = np.array([1.0])
+    res = linprog(c_eq, A_eq=A_eq, b_eq=b_eq, bounds=(0, 1), integrality=1,
+                  callback=cb, method="highs")
+    _assert_success(res, desired_fun=-1.0, desired_x=[1, 0])
+    assert_allclose(calls[-1].con, res.con)
+    for mid in calls[:-1]:
+        if mid.x is None or np.isnan(mid.x).all():
+            continue
+        assert mid.slack.shape == (0,)
+        assert_allclose(mid.con, b_eq - A_eq @ mid.x)
+        assert_allclose(mid.fun, float(c_eq @ mid.x))
+
+    seen = []
+
+    def final_only(res):
+        if res.complete:
+            seen.append(res)
+
+    res = linprog([0.0, 0.0], bounds=(0, 0), integrality=1,
+                  callback=final_only, method="highs")
+    _assert_success(res, desired_fun=0.0, desired_x=[0, 0])
+    for key in ("mip_node_count", "mip_dual_bound", "mip_gap"):
+        assert seen[-1][key] == res[key]
+
+    c_lp, A_lp, b_lp, _, _ = _callback_lp()
+
+    def no_mip_fields(res):
+        assert "mip_node_count" not in res
+
+    with pytest.warns(OptimizeWarning, match="integrality"):
+        res = linprog(c_lp, A_ub=A_lp, b_ub=b_lp, integrality=1,
+                      callback=no_mip_fields, method="highs-ds",
+                      options={"presolve": False})
+    _assert_success(res, desired_fun=-18.0, desired_x=[2, 6])
+    assert "mip_node_count" not in res
+
+    incumbents = []
+
+    def stop_at_incumbent(res):
+        if res.complete or res.x is None or np.isnan(res.x).all():
+            return None
+        incumbents.append(np.array(res.x, copy=True))
+        return True
+
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=(0, 1), integrality=1,
+                  callback=stop_at_incumbent, method="highs",
+                  options={"presolve": False})
+    assert res.nit >= 0
+    assert res.crossover_nit >= 0
+    if incumbents:
+        assert res.status == 5
+        assert res.success is False
+        assert res.x is not None
+        assert_allclose(res.fun, float(c @ res.x))
+        assert_allclose(res.slack, np.ravel(b_ub - A_ub @ res.x), atol=1e-8)
+        for key in ("mip_node_count", "mip_dual_bound", "mip_gap"):
+            assert key in res
+    else:
+        _assert_success(res)
+
+    def stop_iter(res):
+        if not res.complete:
+            raise StopIteration
+
+    res = linprog(c_eq, A_eq=A_eq, b_eq=b_eq, bounds=(0, 1), integrality=1,
+                  callback=stop_iter, method="highs",
+                  options={"presolve": False})
+    assert res.status == 5
+    assert res.success is False
+
+
+@pytest.mark.thread_unsafe(reason="replaces Highs.setCallback")
+def test_highs_callback_count_not_sentinel(monkeypatch):
+    nits = []
+
+    def cb(res):
+        nits.append(res.nit)
+        assert res.nit >= 0
+
+    res = linprog(-np.array([1., 1.]), bounds=(0, 1), integrality=1,
+                  callback=cb)
+    assert nits
+    assert res.nit >= 0
+    assert res.crossover_nit >= 0
+    assert res.mip_node_count >= 0
+    assert res.success
+
+    from scipy.optimize._highspy import _core as core
+
+    orig = core._Highs.setCallback
+
+    def set_callback(self, fn, data):
+        if fn is None:
+            return orig(self, None, data)
+
+        def wrap(kind, message, data_out, data_in, user):
+            data_out.mip_node_count = -1
+            data_out.simplex_iteration_count = -1
+            data_out.ipm_iteration_count = -1
+            return fn(kind, message, data_out, data_in, user)
+
+        return orig(self, wrap, data)
+
+    monkeypatch.setattr(core._Highs, "setCallback", set_callback)
+    value = np.array([6., 5., 8., 9., 6., 7., 3., 6.])
+    weight = np.array([2., 3., 6., 7., 5., 9., 4., 5.])
+    calls = []
+
+    def record(res):
+        calls.append(res)
+        assert res.nit >= 0
+        if not res.complete:
+            assert res.mip_node_count == res.nit
+
+    res = linprog(-value, A_ub=weight.reshape(1, -1), b_ub=[15.],
+                  bounds=(0, 1), integrality=1, callback=record,
+                  method="highs", options={"presolve": False})
+    assert calls[-1].complete is True
+    assert calls[-1].nit == res.nit
+    assert res.nit >= 0
+    assert res.crossover_nit >= 0
+    assert res.mip_node_count >= 0
+    for call in calls[:-1]:
+        if call.x is None or np.isnan(call.x).all():
+            raise AssertionError("unknown node count was delivered")
+        assert call.nit == 0
+
+
+@pytest.mark.thread_unsafe(reason="replaces Highs.setCallback")
+def test_highs_callback_not_registered_without_callback(monkeypatch):
+    from scipy.optimize._highspy import _core as core
+
+    orig = core._Highs.setCallback
+    seen = []
+
+    def set_callback(self, fn, data):
+        seen.append(fn)
+        return orig(self, fn, data)
+
+    monkeypatch.setattr(core._Highs, "setCallback", set_callback)
+    linprog([-1.0, -1.0], bounds=(0, 1), method="highs")
+    linprog([-1.0, -1.0], bounds=(0, 1), method="highs", callback=None)
+    milp([-1.0, -1.0])
+    assert seen == []
+    linprog([-1.0, -1.0], bounds=(0, 1), method="highs",
+            callback=lambda res: None, options={"presolve": False})
+    assert any(fn is not None for fn in seen)
+
+
+def test_milp_has_no_callback():
+    with pytest.raises(TypeError):
+        milp([1.0], callback=lambda res: None)
 
 
 ############################################
