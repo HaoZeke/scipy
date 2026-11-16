@@ -2733,6 +2733,10 @@ def _assert_mip_callback(problem, stop=None):
     assert calls
     assert calls[-1]['complete'] is True
     _assert_callback_matches_result(calls[-1], res)
+    # HiGHS's -1 unknown sentinel must not come out as an iteration count.
+    assert res.nit >= 0
+    assert res.crossover_nit >= 0
+    assert calls[-1]['nit'] >= 0
     for key in ('mip_node_count', 'mip_dual_bound', 'mip_gap'):
         assert calls[-1][key] == res[key]
     for mid in calls[:-1]:
@@ -2740,6 +2744,7 @@ def _assert_mip_callback(problem, stop=None):
         assert mid['success'] is False
         assert mid['status'] == 0
         assert mid['phase'] == 2
+        assert mid['nit'] >= 0
         assert mid['x'].shape == (c.size,)
         assert mid['slack'].shape == (b_ub.size,)
         assert mid['con'].shape == (0,)
@@ -2754,12 +2759,14 @@ def _assert_mip_callback(problem, stop=None):
 
 
 def test_linprog_mip_callback_incumbent_and_nodes():
+    # An improving solution is not part of the contract. Presolve, or a
+    # solution stored without ``kCallbackMipImprovingSolution``, can
+    # finish the MIP with only node events and the final call. When an
+    # incumbent is delivered, ``_assert_mip_callback`` checks its
+    # objective and slack against the original model.
     for problem in (_knapsack_problem(), _set_cover_problem()):
         calls, res = _assert_mip_callback(problem)
         _assert_success(res)
-        incumbents = [call for call in calls[:-1]
-                      if not np.isnan(call['x']).all()]
-        assert incumbents
         nodes = [call['nit'] for call in calls[:-1]
                  if np.isnan(call['x']).all()]
         # Our filter drops a repeated node count. HiGHS does not promise
@@ -2816,10 +2823,14 @@ def test_linprog_mip_callback_equality_residual():
     _assert_success(res, desired_fun=-1.0, desired_x=[1, 0])
     assert calls[-1].complete is True
     assert_allclose(calls[-1].con, res.con)
+    assert res.nit >= 0
+    assert res.crossover_nit >= 0
+    # HiGHS may accept the integer point without an improving-solution
+    # callback. Every incumbent it does report uses the original equality.
     incumbents = [call for call in calls[:-1]
                   if call.x is not None and not np.isnan(call.x).all()]
-    assert incumbents
     for call in incumbents:
+        assert call.nit >= 0
         assert call.slack.shape == (0,)
         assert_allclose(call.con, b_eq - A_eq @ call.x)
         assert_allclose(call.fun, float(c @ call.x))
@@ -2846,6 +2857,10 @@ def test_linprog_zero_mip_reports_mip_fields():
 def test_linprog_mip_callback_stop_keeps_incumbent():
     # Stopping after an improving solution must not throw that
     # incumbent away. HiGHS status kInterrupt still has it.
+    # The event itself is not guaranteed: presolve, or a solution
+    # stored without ``kCallbackMipImprovingSolution``, can solve the
+    # model with only the final callback. The stop contract is checked
+    # when the event is delivered.
     c, A_ub, b_ub = _knapsack_problem()
     seen = []
 
@@ -2857,7 +2872,11 @@ def test_linprog_mip_callback_stop_keeps_incumbent():
 
     res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=(0, 1), integrality=1,
                   callback=cb, method='highs')
-    assert seen
+    assert res.nit >= 0
+    assert res.crossover_nit >= 0
+    if not seen:
+        _assert_success(res)
+        return
     assert res.status == 5
     assert res.success is False
     assert res.x is not None
@@ -2871,11 +2890,71 @@ def test_linprog_mip_callback_stop_keeps_incumbent():
 def test_linprog_mip_nit_not_negative_sentinel():
     # No LP iterations: the simplex count is 0 and the IPM count is left
     # at the HiGHS "not run" sentinel. ``0 or -1`` used to report -1.
-    res = linprog(-np.array([1., 1.]), bounds=(0, 1), integrality=1)
+    nits = []
+
+    def cb(res):
+        nits.append(res.nit)
+        assert res.nit >= 0
+
+    res = linprog(-np.array([1., 1.]), bounds=(0, 1), integrality=1,
+                  callback=cb)
+    assert nits
     assert res.nit >= 0
     assert res.crossover_nit >= 0
     assert res.success
     assert_allclose(res.x, [1., 1.])
+
+
+@pytest.mark.thread_unsafe(reason="replaces Highs.setCallback for the process")
+def test_linprog_mip_callback_unknown_count_is_not_nit(monkeypatch):
+    # HiGHS initializes mip_node_count, and the LP iteration fields on a
+    # MIP callback, to -1. clearHighsCallbackOutput does the same before
+    # the node count is filled in. Force that sentinel on every MIP
+    # event. An improving solution is still delivered; a node event with
+    # an unknown count is not. Neither reports -1 as nit. The final call
+    # and the returned result keep the nonnegative LP iteration count.
+    from scipy.optimize._highspy import _core as core
+
+    orig = core._Highs.setCallback
+
+    def set_callback(self, fn, data):
+        if fn is None:
+            return orig(self, None, data)
+
+        def wrap(kind, message, data_out, data_in, user):
+            data_out.mip_node_count = -1
+            data_out.simplex_iteration_count = -1
+            data_out.ipm_iteration_count = -1
+            return fn(kind, message, data_out, data_in, user)
+
+        return orig(self, wrap, data)
+
+    monkeypatch.setattr(core._Highs, "setCallback", set_callback)
+    c, A_ub, b_ub = _knapsack_problem()
+    calls = []
+
+    def cb(res):
+        calls.append(res)
+        assert res.nit >= 0
+        if not res.complete:
+            assert res.mip_node_count == res.nit
+            assert res.mip_node_count >= 0
+
+    res = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=(0, 1), integrality=1,
+                  callback=cb, method='highs')
+    assert calls
+    assert calls[-1].complete is True
+    assert calls[-1].nit == res.nit
+    assert res.nit >= 0
+    assert res.crossover_nit >= 0
+    # An improving solution is still reported when HiGHS raises one.
+    # Its unknown node count is 0, not the sentinel. Node events with
+    # that sentinel are not passed through.
+    for call in calls[:-1]:
+        if call.x is None or np.isnan(call.x).all():
+            continue
+        assert call.nit == 0
+        assert_allclose(call.fun, float(c @ call.x))
 
 
 class TestLinprogHiGHSSimplexDual(LinprogHiGHSTests):
